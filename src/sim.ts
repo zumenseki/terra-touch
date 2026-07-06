@@ -1,74 +1,96 @@
 // CPU 地形シミュレーション (DESIGN-m1m2.md 準拠)
-// 256² 格子で 岩盤/土/水 を保持し、ブラシ変形・安息角スランプ・浅水パイプモデルを回す。
+// 岩盤/土/水 を格子で保持し、ブラシ変形・安息角スランプ・浅水パイプモデルを回す。
 // 結果は RGBA16F の DataTexture [bedrock, soil, water, wetness] に毎フレーム詰めて GPU 描画へ渡す。
 // 全量は CPU 配列の総和で直接検証できる (GPU 読み戻し不要)。
+//
+// 2モード:
+//   procedural (既定) = 内蔵の谷地形を生成 (サンドボックス index.html)
+//   geo             = 外部の実 DEM を bedrock に注入 (geo.html)。実地形は bedrock=不動、
+//                     押した所だけ bedrock→soil(可動) に変わり自然に崩れる。
 
 import * as THREE from 'three/webgpu';
 import { fbm, ridged } from './noise';
 import { digProfile, depositProfile, computeBrushNorm, type BrushNorm } from './brush-profile';
 
-export const SIM_N = 192;   // CPU シム格子 (60fps 目標での実測最適・M4 で worker+256² 化予定)
-export const WORLD = 600;   // m
-export const HEIGHT_M = 90;  // 最大岩盤標高 m
+export const SIM_N = 192;   // 既定シム格子
+export const WORLD = 600;   // 既定ワールド m
+export const HEIGHT_M = 90;  // 既定最大標高 m
 
-const CELL = WORLD / SIM_N;             // 2.34 m
-const AREA = CELL * CELL;               // セル面積 m²
 const G = 9.81;
-const DAMP = 0.995;                     // 水フラックス減衰
-const TALUS = Math.tan((34 * Math.PI) / 180) * CELL; // 安息角の段差閾値 (m/セル)
-const SLUMP_K = 0.5;                    // スランプ緩和係数
-const SIM_DT = 1 / 120;                 // 物理ステップ
-const SOURCE_Q = 12;                    // 湧き水 m³/s
+const DAMP = 0.995;
+const SLUMP_K = 0.5;
+const SIM_DT = 1 / 120;
+const TALUS_ANGLE = (34 * Math.PI) / 180;
+
+export interface SimOpts {
+  n?: number;
+  world?: number;          // m
+  bedrock?: Float32Array;  // n*n メートル。渡すと geo モード
+  brushRadius?: number;    // m
+  sourceQ?: number;        // 点源 m³/s
+}
 
 export interface SimTotals {
-  solid: number;   // Σ(bedrock+soil)·AREA
-  water: number;   // Σwater·AREA
-  drained: number; // 端から出た総量
-  injected: number;// 湧き総量
-  driftPct: number;// 土の初期比 drift%
+  solid: number;
+  water: number;
+  drained: number;
+  injected: number;
+  driftPct: number;
   nan: boolean;
 }
 
-// 谷の中心線 (world x)。j: 上端(0)→下端(N-1)。緩い蛇行・場内に収まる
 function channelX(j: number): number {
   const f = j / (SIM_N - 1);
   return WORLD * 0.5 + Math.sin(f * Math.PI * 1.5) * 55 + Math.sin(f * 7.0) * 14;
 }
-// 谷底の標高 (m)。上端 58m → 下端 8m へ厳密に単調降下 (勾配 ~8%)
 function channelFloor(j: number): number {
   return 58 - (j / (SIM_N - 1)) * 50;
 }
 
 export class TerrainSim {
-  readonly n = SIM_N;
-  readonly cell = CELL;
+  readonly n: number;
+  readonly world: number;
+  readonly cell: number;
+  private readonly area: number;
+  private readonly talus: number;
   bedrock: Float32Array;
   soil: Float32Array;
   water: Float32Array;
   wet: Float32Array;
-  // 非負4フラックス (Mei パイプモデル)。fR[c]=c→右(i+1) 等
   private fL: Float32Array;
   private fR: Float32Array;
   private fU: Float32Array;
   private fD: Float32Array;
-  private surf: Float32Array; // 再利用スクラッチ (bedrock+soil[+water])
+  private surf: Float32Array;
   private packed: Uint16Array;
-  private terrainDirty = true; // bedrock/soil を再パックする必要
+  private terrainDirty = true;
   tex: THREE.DataTexture;
 
   initialSolid = 0;
   injected = 0;
   drained = 0;
-  sourceOn = true;
-  brushRadius = 15;
-  digRate = 6; // m/s (中心)
-
+  sourceOn: boolean;
+  sourceQ: number;
+  rainRate = 0;         // m/s 全面に降らす (geo で実谷に水を集める)
+  brushRadius: number;
+  digRate: number;      // m/s (中心)
   private sourceI: number;
-  private sourceJ = 10;
+  private sourceJ: number;
   private norm: BrushNorm;
 
-  constructor() {
-    const N = SIM_N;
+  constructor(opts: SimOpts = {}) {
+    const geo = !!opts.bedrock;
+    const N = opts.n ?? SIM_N;
+    const world = opts.world ?? WORLD;
+    this.n = N;
+    this.world = world;
+    this.cell = world / N;
+    this.area = this.cell * this.cell;
+    this.talus = Math.tan(TALUS_ANGLE) * this.cell;
+    this.brushRadius = opts.brushRadius ?? (geo ? world / 40 : 15);
+    this.digRate = this.brushRadius * 0.4; // 半径連動 (15m→6m/s で従来一致)
+    this.sourceQ = opts.sourceQ ?? 12;
+
     const len = N * N;
     this.bedrock = new Float32Array(len);
     this.soil = new Float32Array(len);
@@ -81,7 +103,33 @@ export class TerrainSim {
     this.surf = new Float32Array(len);
     this.packed = new Uint16Array(len * 4);
 
-    // 初期地形: 山肌 + 上端→下端へ単調降下する谷を刻む (メートル)
+    if (geo) {
+      this.bedrock.set(opts.bedrock!.subarray(0, len));
+      this.sourceOn = false;
+      this.sourceI = Math.floor(N / 2);
+      this.sourceJ = Math.floor(N / 2);
+    } else {
+      this.generateProcedural();
+      this.sourceOn = true;
+      this.sourceI = Math.round((channelX(10) / WORLD) * (N - 1));
+      this.sourceJ = 10;
+    }
+
+    let s = 0;
+    for (let k = 0; k < len; k++) s += this.bedrock[k];
+    this.initialSolid = s * this.area;
+
+    this.norm = computeBrushNorm(this.brushRadius, this.cell);
+    this.tex = new THREE.DataTexture(this.packed, N, N, THREE.RGBAFormat, THREE.HalfFloatType);
+    this.tex.minFilter = THREE.LinearFilter;
+    this.tex.magFilter = THREE.LinearFilter;
+    this.tex.wrapS = THREE.ClampToEdgeWrapping;
+    this.tex.wrapT = THREE.ClampToEdgeWrapping;
+    this.sync();
+  }
+
+  private generateProcedural() {
+    const N = this.n;
     const smooth = (e0: number, e1: number, x: number) => {
       const t = Math.min(Math.max((x - e0) / (e1 - e0), 0), 1);
       return t * t * (3 - 2 * t);
@@ -95,25 +143,14 @@ export class TerrainSim {
         const x = (i / N) * WORLD;
         const base = fbm(x * 0.004, z * 0.004);
         const mount = ridged(x * 0.008, z * 0.008);
-        // 山肌 25..85m + 全体を下流へ緩く傾ける
         let h = 25 + (base * 0.45 + mount * 0.55) * 60 - zf * 16;
-        // 谷を刻む: 中心±6m で floor まで下げ、28m で山肌へブレンド
         const d = Math.abs(x - chanX);
-        const mask = smooth(28, 6, d); // 1=中心, 0=谷外
+        const mask = smooth(28, 6, d);
         const carved = Math.min(h, floor + (1 - mask) * 6);
         h = h * (1 - mask) + carved * mask;
         this.bedrock[j * N + i] = h;
-        this.wet[j * N + i] = 0;
       }
     }
-
-    let s = 0;
-    for (let k = 0; k < len; k++) s += this.bedrock[k];
-    this.initialSolid = s * AREA;
-
-    this.sourceI = Math.round((channelX(this.sourceJ) / WORLD) * (N - 1));
-
-    // 川を初期シード: 谷に浅い水を張って開始直後から流れを見せる
     for (let j = 0; j < N; j++) {
       const chanX = channelX(j);
       for (let i = 0; i < N; i++) {
@@ -123,24 +160,22 @@ export class TerrainSim {
         if (mask > 0.25) this.water[j * N + i] = 0.6 * mask;
       }
     }
-    this.norm = computeBrushNorm(this.brushRadius, CELL);
-
-    this.tex = new THREE.DataTexture(this.packed, N, N, THREE.RGBAFormat, THREE.HalfFloatType);
-    this.tex.minFilter = THREE.LinearFilter;
-    this.tex.magFilter = THREE.LinearFilter;
-    this.tex.wrapS = THREE.ClampToEdgeWrapping;
-    this.tex.wrapT = THREE.ClampToEdgeWrapping;
-    this.sync();
   }
 
   setBrushRadius(r: number) {
     this.brushRadius = r;
-    this.norm = computeBrushNorm(r, CELL);
+    this.digRate = r * 0.4;
+    this.norm = computeBrushNorm(r, this.cell);
   }
 
-  // ── バイリニア標高サンプル (レイキャスト用・メートル) ──
+  /** 水源をワールド uv 位置へ設定 (geo で任意地点に湧水) */
+  setSourceUV(u: number, v: number) {
+    this.sourceI = Math.round(Math.min(Math.max(u, 0), 1) * (this.n - 1));
+    this.sourceJ = Math.round(Math.min(Math.max(v, 0), 1) * (this.n - 1));
+  }
+
   surfaceHeightUV(u: number, v: number): number {
-    const N = SIM_N;
+    const N = this.n;
     const fx = Math.min(Math.max(u, 0), 1) * (N - 1);
     const fy = Math.min(Math.max(v, 0), 1) * (N - 1);
     const i0 = Math.floor(fx);
@@ -149,18 +184,18 @@ export class TerrainSim {
     const j1 = Math.min(j0 + 1, N - 1);
     const tx = fx - i0;
     const ty = fy - j0;
-    const h = (i: number, j: number) => this.bedrock[j * N + i] + this.soil[j * N + i];
+    const B = this.bedrock, S = this.soil;
+    const h = (i: number, j: number) => B[j * N + i] + S[j * N + i];
     const a = h(i0, j0) * (1 - tx) + h(i1, j0) * tx;
     const b = h(i0, j1) * (1 - tx) + h(i1, j1) * tx;
     return a * (1 - ty) + b * ty;
   }
 
   // ── ブラシ: 押した体積を再配分 (完全保存) ──
-  //   'dig'   = 中心を掘り (w) 縁へ盛る (g)  … 指を押し込む
-  //   'raise' = 縁から借り (g) 中心へ盛る (w)  … 土手を押し上げる
   brush(u: number, v: number, dt: number, mode: 'dig' | 'raise' = 'dig') {
-    const N = SIM_N;
-    const ext = Math.ceil(this.norm.outerRadius / CELL) + 1;
+    const N = this.n;
+    const cell = this.cell;
+    const ext = Math.ceil(this.norm.outerRadius / cell) + 1;
     const ci = Math.min(Math.max(u * (N - 1), ext), N - 1 - ext);
     const cj = Math.min(Math.max(v * (N - 1), ext), N - 1 - ext);
     const R = this.brushRadius;
@@ -168,19 +203,17 @@ export class TerrainSim {
     const ri = Math.round(ci);
     const rj = Math.round(cj);
 
-    // 取る/盛るプロファイルをモードで入れ替え
     const takeProf = mode === 'dig' ? digProfile : depositProfile;
     const dropProf = mode === 'dig' ? depositProfile : digProfile;
     const dropSum = mode === 'dig' ? this.norm.sumG : this.norm.sumW;
 
-    // pass1: takeProf に沿って掘削 (soil 優先→bedrock)、実際に取れた量を集計
     let removed = 0;
     for (let dj = -ext; dj <= ext; dj++) {
       for (let di = -ext; di <= ext; di++) {
         const i = ri + di;
         const j = rj + dj;
         if (i < 0 || j < 0 || i >= N || j >= N) continue;
-        const r = Math.hypot(ri + di - ci, rj + dj - cj) * CELL;
+        const r = Math.hypot(ri + di - ci, rj + dj - cj) * cell;
         const w = takeProf(r, R);
         if (w <= 0) continue;
         let need = w * amt;
@@ -196,7 +229,6 @@ export class TerrainSim {
     if (removed <= 0) return;
     this.terrainDirty = true;
 
-    // pass2: dropProf/Σ で配分 → Σdrop = removed (厳密保存)
     if (dropSum <= 0) {
       this.soil[rj * N + ri] += removed;
       return;
@@ -206,7 +238,7 @@ export class TerrainSim {
         const i = ri + di;
         const j = rj + dj;
         if (i < 0 || j < 0 || i >= N || j >= N) continue;
-        const r = Math.hypot(ri + di - ci, rj + dj - cj) * CELL;
+        const r = Math.hypot(ri + di - ci, rj + dj - cj) * cell;
         const g = dropProf(r, R);
         if (g <= 0) continue;
         this.soil[j * N + i] += (g / dropSum) * removed;
@@ -214,13 +246,13 @@ export class TerrainSim {
     }
   }
 
-  // ── 安息角スランプ (土のみ移動・各辺1回処理で厳密保存) ──
   private slump() {
-    const N = SIM_N;
+    const N = this.n;
+    const TALUS = this.talus;
     const B = this.bedrock;
     const S = this.soil;
     const H = this.surf;
-    for (let c = 0; c < H.length; c++) H[c] = B[c] + S[c]; // 高さ事前計算
+    for (let c = 0; c < H.length; c++) H[c] = B[c] + S[c];
     const kk = SLUMP_K * 0.5;
     let moved = false;
     for (let j = 0; j < N; j++) {
@@ -259,29 +291,37 @@ export class TerrainSim {
     if (moved) this.terrainDirty = true;
   }
 
-  // ── 浅水 1 サブステップ (パイプモデル・surface 配列を事前計算) ──
   private waterStep(dt: number) {
-    const N = SIM_N;
+    const N = this.n;
+    const cell = this.cell;
+    const AREA = this.area;
     const B = this.bedrock;
     const S = this.soil;
     const W = this.water;
     const fL = this.fL, fR = this.fR, fU = this.fU, fD = this.fD;
     const surf = this.surf;
 
-    // 湧き水注入
+    // 全面降雨 (geo: 実谷に水が集まる)
+    if (this.rainRate > 0) {
+      const add = this.rainRate * dt;
+      for (let k = 0; k < W.length; k++) W[k] += add;
+      this.injected += add * AREA * W.length;
+    }
+
+    // 点源
     if (this.sourceOn) {
-      const add = SOURCE_Q * dt;
+      const add = this.sourceQ * dt;
       const si = this.sourceI, sj = this.sourceJ;
       let wsum = 0;
-      const rad = Math.ceil(3 / CELL);
+      const rad = Math.max(1, Math.ceil((cell < 6 ? 3 : cell * 1.5) / cell));
       const wgt: number[] = [];
       const cells: number[] = [];
       for (let dj = -rad; dj <= rad; dj++) {
         for (let di = -rad; di <= rad; di++) {
           const i = si + di, j = sj + dj;
           if (i < 0 || j < 0 || i >= N || j >= N) continue;
-          const d = Math.hypot(di, dj) * CELL;
-          const wv = Math.max(0, 1 - d / 3);
+          const dd = Math.hypot(di, dj);
+          const wv = Math.max(0, 1 - dd / (rad + 0.5));
           if (wv <= 0) continue;
           wgt.push(wv); cells.push(j * N + i); wsum += wv;
         }
@@ -290,11 +330,9 @@ export class TerrainSim {
       this.injected += add;
     }
 
-    // 表面高 (bedrock+soil+water) を事前計算
     for (let c = 0; c < surf.length; c++) surf[c] = B[c] + S[c] + W[c];
-    const co = dt * G * CELL;
+    const co = dt * G * cell;
 
-    // flux 更新 (旧 surf から)
     for (let j = 0; j < N; j++) {
       const row = j * N;
       for (let i = 0; i < N; i++) {
@@ -318,7 +356,6 @@ export class TerrainSim {
       }
     }
 
-    // depth 更新 (flux から) + 端排水
     let drained = 0;
     for (let j = 0; j < N; j++) {
       const row = j * N;
@@ -343,11 +380,9 @@ export class TerrainSim {
     this.drained += drained * dt;
   }
 
-  /** 1 フレーム分進める (brush は呼び出し側で別途 brush() 済み前提) */
   step(frameDt: number, waterIters = 2) {
     this.slump();
-    const dt = SIM_DT;
-    for (let k = 0; k < waterIters; k++) this.waterStep(dt);
+    for (let k = 0; k < waterIters; k++) this.waterStep(SIM_DT);
     void frameDt;
     this.updateWetness();
   }
@@ -361,8 +396,6 @@ export class TerrainSim {
     }
   }
 
-  /** CPU 配列を RGBA16F テクスチャへ詰めて GPU へ反映
-   *  水/濡れ (b,a) は毎回、岩盤/土 (r,g) は変形時のみ再パック (半float変換を半減) */
   sync() {
     const W = this.water, wet = this.wet;
     const p = this.packed;
@@ -394,8 +427,8 @@ export class TerrainSim {
       water += W[k];
       if (!nan && (Number.isNaN(B[k]) || Number.isNaN(S[k]) || Number.isNaN(W[k]))) nan = true;
     }
-    solid *= AREA;
-    water *= AREA;
+    solid *= this.area;
+    water *= this.area;
     return {
       solid,
       water,
