@@ -16,10 +16,24 @@
 </head>
 <body>
   <div id="hud">
-    <b>terra-touch M0</b><br>
-    ドラッグ=回転 / ホイール=ズーム / 右ドラッグ=移動<br>
-    <span id="backend">初期化中…</span> | <span id="fps">-</span>
+    <b>terra-touch M2</b><br>
+    左ドラッグ=地面を彫る / 右ドラッグ=回転 / ホイール=ズーム / 中ドラッグ=移動<br>
+    <span id="backend">初期化中…</span> | <span id="fps">-</span> |
+    土drift <span id="soil">-</span> | 水 <span id="water">-</span>
   </div>
+  <div id="tools">
+    <button id="mode-dig" class="on">⛏ 掘る</button>
+    <button id="mode-raise">⛰ 盛る</button>
+    <button id="src-toggle" class="on">💧 湧水 ON</button>
+  </div>
+  <style>
+    #tools { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 8px; }
+    #tools button { font-size: 14px; padding: 8px 14px; border-radius: 10px;
+      border: 1px solid rgba(255,255,255,.25); background: rgba(0,0,0,.5); color: #eee;
+      cursor: pointer; backdrop-filter: blur(4px); }
+    #tools button.on { background: #2c7; color: #062; border-color: #2c7; font-weight: 700; }
+  </style>
   <script type="module" src="/src/main.ts"></script>
 </body>
 </html>
