@@ -169,26 +169,31 @@ async function main() {
   const shade = mix(float(0.72), float(1.0), smoothstep(0.3, 0.95, nLocal.y));
   const wetA = texture(simTex, uv()).a;
   const photo = texture(imgTex, uv()).mul(shade);
-  mat.colorNode = mix(photo, photo.mul(0.5), smoothstep(0.05, 0.8, wetA));
+  mat.colorNode = mix(photo, photo.mul(0.7), smoothstep(0.2, 0.9, wetA)); // 濡れ暗転は控えめに
   const terrain = new THREE.Mesh(geo, mat);
   scene.add(terrain);
 
   const wgeo = new THREE.PlaneGeometry(worldW, worldW, WATER_MESH - 1, WATER_MESH - 1);
   wgeo.rotateX(-Math.PI / 2);
-  const wmat = new THREE.MeshStandardNodeMaterial({ metalness: 0, roughness: 0.07 });
+  const wmat = new THREE.MeshStandardNodeMaterial({ metalness: 0, roughness: 0.13 });
   wmat.transparent = true; wmat.depthWrite = false;
+  wmat.polygonOffset = true; wmat.polygonOffsetFactor = -2; wmat.polygonOffsetUnits = -2; // z-fight緩和
   const depth = texture(simTex, uv()).b;
   const surfAt = (ox: number, oy: number) => groundAt(ox, oy).add(texture(simTex, uv().add(vec2(ox * demTexel, oy * demTexel))).b.mul(VERT_EXAG));
   wmat.positionNode = positionLocal.add(vec3(0, surfAt(0, 0), 0));
-  const rip = sin(uv().x.mul(400).add(uTime.mul(1.5))).add(sin(uv().y.mul(360).sub(uTime.mul(1.2)))).mul(0.08);
+  // さざ波 (控えめ)
+  const rip = sin(uv().x.mul(170).add(uTime.mul(1.2))).add(sin(uv().y.mul(150).sub(uTime))).mul(0.04);
   const wN = nrm(vec3(surfAt(-1, 0).sub(surfAt(1, 0)).add(rip), cell * 2, surfAt(0, 1).sub(surfAt(0, -1)).add(rip)));
   wmat.normalNode = transformNormalToView(wN);
-  // 深さで色(浅=青緑透明/深=濃紺) + フレネルで空を映し込む
-  const baseWater = mix(vec3(0.09, 0.26, 0.32), vec3(0.02, 0.07, 0.17), smoothstep(0.3, 6.0, depth));
-  const fresnel = float(1).sub(smoothstep(0.15, 0.9, wN.y)); // 斜め=反射強
-  const skyRefl = vec3(0.52, 0.66, 0.82);
-  wmat.colorNode = mix(baseWater, skyRefl, fresnel.mul(0.55));
-  wmat.opacityNode = mix(float(0.5), float(0.96), smoothstep(0.05, 1.2, depth));
+  // 深さで色 + フレネルで空を映す(弱め)
+  const baseWater = mix(vec3(0.08, 0.22, 0.28), vec3(0.02, 0.06, 0.14), smoothstep(0.4, 8.0, depth));
+  const fresnel = float(1).sub(smoothstep(0.2, 0.85, wN.y));
+  wmat.colorNode = mix(baseWater, vec3(0.46, 0.58, 0.72), fresnel.mul(0.35));
+  // 物理: 立った水は「平地」に「十分な深さ」でしか存在しない。
+  //   → 地形傾斜が急な所は水面を描かない(斜面の薄い流去水は膜として描かず、地形の濡れ表現のみ)。
+  const gTerr = nrm(vec3(groundAt(-1, 0).sub(groundAt(1, 0)), cell * 2, groundAt(0, 1).sub(groundAt(0, -1))));
+  const flat = smoothstep(0.55, 0.9, gTerr.y); // 1=平地, 0=急斜面
+  wmat.opacityNode = smoothstep(0.3, 2.0, depth).mul(flat).mul(0.92);
   const waterMesh = new THREE.Mesh(wgeo, wmat);
   waterMesh.renderOrder = 1; scene.add(waterMesh);
 
@@ -268,8 +273,8 @@ async function main() {
   btnDig.addEventListener('click', () => { if (!sculptOn) { sculptOn = true; applyControlMode(); refreshLookBtn(); } setMode('dig'); });
   btnRaise.addEventListener('click', () => { if (!sculptOn) { sculptOn = true; applyControlMode(); refreshLookBtn(); } setMode('raise'); });
   btnRain.addEventListener('click', () => {
-    raining = !raining; sim.rainRate = raining ? 0.9 : 0;
-    if (raining) { everRained = true; } else { settle = 1200; }
+    raining = !raining; sim.rainRate = raining ? 0.12 : 0;
+    if (raining) { everRained = true; } else { settle = 1800; }
     btnRain.textContent = `🌧 雨 ${raining ? 'ON' : 'OFF'}`; btnRain.classList.toggle('on', raining);
   });
   btnReset.addEventListener('click', () => {
@@ -304,7 +309,7 @@ async function main() {
       for (let k = 0; k < f; k++) { sim.brush(u, v, 1 / 60, m); sim.step(1 / 60, 0); }
       sim.sync(); await renderer.renderAsync(scene, camera);
     },
-    async rainFor(sec: number, rate = 0.9) {
+    async rainFor(sec: number, rate = 0.12) {
       sim.rainRate = rate; const f = Math.round(sec * 60);
       for (let k = 0; k < f; k++) sim.step(1 / 60, 1);
       sim.rainRate = 0; sim.sync(); await renderer.renderAsync(scene, camera);
