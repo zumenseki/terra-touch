@@ -13,6 +13,7 @@ import {
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { TerrainSim } from './sim';
+import { GpuSim } from './sim-gpu';
 import { LOCATIONS, pickLocation, computeZoom } from './locations';
 
 const GRID = 4, TILE = 256;
@@ -96,30 +97,45 @@ async function main() {
   const latR = (LAT * Math.PI) / 180;
   const worldW = (EARTH_C / 2 ** ZOOM) * GRID * Math.cos(latR);
 
-  const factor = DEM_SIZE / SIM_N;
-  const simBed = new Float32Array(SIM_N * SIM_N);
-  for (let j = 0; j < SIM_N; j++) for (let i = 0; i < SIM_N; i++) {
-    let acc = 0;
-    for (let bj = 0; bj < factor; bj++) { const sj = j * factor + bj; for (let bi = 0; bi < factor; bi++) acc += demH[sj * DEM_SIZE + (i * factor + bi)]; }
-    simBed[j * SIM_N + i] = acc / (factor * factor);
+  // ── シム: GPU(?gpu=1 かつ WebGPU)= 1024²高解像度 / それ以外 = CPU 512² ──
+  const isWebGPU = !!(renderer.backend as { isWebGPUBackend?: boolean }).isWebGPUBackend;
+  // 既定: デスクトップ WebGPU は GPU(1024²)。モバイルは安全のため CPU 既定 (?gpu=1 で試行可)。
+  const gpuParam = new URLSearchParams(location.search).get('gpu');
+  const USE_GPU = isWebGPU && gpuParam !== '0' && (!IS_TOUCH || gpuParam === '1');
+
+  let gpuSim: GpuSim | null = null;
+  let cpuSim: TerrainSim | null = null;
+  let cpuInitBed: Float32Array | null = null;
+  let baseDemTex: THREE.DataTexture | null = null;
+  let simBaseTex: THREE.DataTexture | null = null;
+  let simTex: THREE.DataTexture | null = null;
+
+  if (USE_GPU) {
+    gpuSim = new GpuSim(renderer, { n: DEM_SIZE, world: worldW, bedrock: demH });
+    gpuSim.syncDisp();
+  } else {
+    const factor = DEM_SIZE / SIM_N;
+    const simBed = new Float32Array(SIM_N * SIM_N);
+    for (let j = 0; j < SIM_N; j++) for (let i = 0; i < SIM_N; i++) {
+      let acc = 0;
+      for (let bj = 0; bj < factor; bj++) { const sj = j * factor + bj; for (let bi = 0; bi < factor; bi++) acc += demH[sj * DEM_SIZE + (i * factor + bi)]; }
+      simBed[j * SIM_N + i] = acc / (factor * factor);
+    }
+    cpuSim = new TerrainSim({ n: SIM_N, world: worldW, bedrock: simBed });
+    cpuInitBed = simBed.slice();
+    const toHalf = THREE.DataUtils.toHalfFloat;
+    const baseHalf = new Uint16Array(demH.length);
+    for (let k = 0; k < demH.length; k++) baseHalf[k] = toHalf(demH[k]);
+    baseDemTex = new THREE.DataTexture(baseHalf, DEM_SIZE, DEM_SIZE, THREE.RedFormat, THREE.HalfFloatType);
+    baseDemTex.minFilter = baseDemTex.magFilter = THREE.LinearFilter;
+    baseDemTex.wrapS = baseDemTex.wrapT = THREE.ClampToEdgeWrapping; baseDemTex.needsUpdate = true;
+    const simBaseHalf = new Uint16Array(simBed.length);
+    for (let k = 0; k < simBed.length; k++) simBaseHalf[k] = toHalf(simBed[k]);
+    simBaseTex = new THREE.DataTexture(simBaseHalf, SIM_N, SIM_N, THREE.RedFormat, THREE.HalfFloatType);
+    simBaseTex.minFilter = simBaseTex.magFilter = THREE.LinearFilter;
+    simBaseTex.wrapS = simBaseTex.wrapT = THREE.ClampToEdgeWrapping; simBaseTex.needsUpdate = true;
+    simTex = cpuSim.tex;
   }
-
-  const sim = new TerrainSim({ n: SIM_N, world: worldW, bedrock: simBed });
-
-  const toHalf = THREE.DataUtils.toHalfFloat;
-  const baseHalf = new Uint16Array(demH.length);
-  for (let k = 0; k < demH.length; k++) baseHalf[k] = toHalf(demH[k]);
-  const baseDemTex = new THREE.DataTexture(baseHalf, DEM_SIZE, DEM_SIZE, THREE.RedFormat, THREE.HalfFloatType);
-  baseDemTex.minFilter = baseDemTex.magFilter = THREE.LinearFilter;
-  baseDemTex.wrapS = baseDemTex.wrapT = THREE.ClampToEdgeWrapping; baseDemTex.needsUpdate = true;
-
-  const simBaseHalf = new Uint16Array(simBed.length);
-  for (let k = 0; k < simBed.length; k++) simBaseHalf[k] = toHalf(simBed[k]);
-  const simBaseTex = new THREE.DataTexture(simBaseHalf, SIM_N, SIM_N, THREE.RedFormat, THREE.HalfFloatType);
-  simBaseTex.minFilter = simBaseTex.magFilter = THREE.LinearFilter;
-  simBaseTex.wrapS = simBaseTex.wrapT = THREE.ClampToEdgeWrapping; simBaseTex.needsUpdate = true;
-
-  const simTex = sim.tex;
 
   const imgTex = new THREE.CanvasTexture(img.canvas);
   imgTex.colorSpace = THREE.SRGBColorSpace;
@@ -155,38 +171,65 @@ async function main() {
 
   const demTexel = 1 / DEM_SIZE;
   const cell = worldW / DEM_SIZE;
-  const baseAt = (ox: number, oy: number) => texture(baseDemTex, uv().add(vec2(ox * demTexel, oy * demTexel))).r;
-  const simSolidAt = (ox: number, oy: number) => { const s = texture(simTex, uv().add(vec2(ox * demTexel, oy * demTexel))); return s.r.add(s.g); };
-  const simBaseAt = (ox: number, oy: number) => texture(simBaseTex, uv().add(vec2(ox * demTexel, oy * demTexel))).r;
-  const groundAt = (ox: number, oy: number) => baseAt(ox, oy).add(simSolidAt(ox, oy)).sub(simBaseAt(ox, oy)).mul(VERT_EXAG);
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  let groundAt: (ox: number, oy: number) => any;
+  let depthNode: any, wetNode: any;
+  let waterAt: (ox: number, oy: number) => any;
+  if (USE_GPU) {
+    const d = gpuSim!.dispTex; // [bed+soil, water, wet, 1]・Nearest
+    const dAt = (ox: number, oy: number) => texture(d, uv().add(vec2(ox * demTexel, oy * demTexel)));
+    groundAt = (ox, oy) => dAt(ox, oy).r.mul(VERT_EXAG);
+    depthNode = dAt(0, 0).g;
+    wetNode = dAt(0, 0).b;
+    waterAt = (ox, oy) => dAt(ox, oy).g;
+  } else {
+    const baseAt = (ox: number, oy: number) => texture(baseDemTex!, uv().add(vec2(ox * demTexel, oy * demTexel))).r;
+    const simSolidAt = (ox: number, oy: number) => { const s = texture(simTex!, uv().add(vec2(ox * demTexel, oy * demTexel))); return s.r.add(s.g); };
+    const simBaseAt = (ox: number, oy: number) => texture(simBaseTex!, uv().add(vec2(ox * demTexel, oy * demTexel))).r;
+    groundAt = (ox, oy) => baseAt(ox, oy).add(simSolidAt(ox, oy)).sub(simBaseAt(ox, oy)).mul(VERT_EXAG);
+    depthNode = texture(simTex!, uv()).b;
+    wetNode = texture(simTex!, uv()).a;
+    waterAt = (ox, oy) => texture(simTex!, uv().add(vec2(ox * demTexel, oy * demTexel))).b;
+  }
 
-  const geo = new THREE.PlaneGeometry(worldW, worldW, MESH_N - 1, MESH_N - 1);
+  // GPU は 1024² シムと 1:1 でメッシュも高精細に
+  const meshN = USE_GPU ? (IS_TOUCH ? 768 : 1024) : MESH_N;
+  const waterMeshN = USE_GPU ? (IS_TOUCH ? 512 : 768) : WATER_MESH;
+  const geo = new THREE.PlaneGeometry(worldW, worldW, meshN - 1, meshN - 1);
   geo.rotateX(-Math.PI / 2);
   const mat = new THREE.MeshStandardNodeMaterial({ roughness: 0.95, metalness: 0 });
   mat.positionNode = positionLocal.add(vec3(0, groundAt(0, 0), 0));
   const nLocal = nrm(vec3(groundAt(-1, 0).sub(groundAt(1, 0)), cell * 2, groundAt(0, 1).sub(groundAt(0, -1))));
   mat.normalNode = transformNormalToView(nLocal);
   const shade = mix(float(0.72), float(1.0), smoothstep(0.3, 0.95, nLocal.y));
-  const wetA = texture(simTex, uv()).a;
+  const wetA = wetNode;
   const photo = texture(imgTex, uv()).mul(shade);
   mat.colorNode = mix(photo, photo.mul(0.7), smoothstep(0.2, 0.9, wetA)); // 濡れ暗転は控えめに
   const terrain = new THREE.Mesh(geo, mat);
   scene.add(terrain);
 
-  const wgeo = new THREE.PlaneGeometry(worldW, worldW, WATER_MESH - 1, WATER_MESH - 1);
+  const wgeo = new THREE.PlaneGeometry(worldW, worldW, waterMeshN - 1, waterMeshN - 1);
   wgeo.rotateX(-Math.PI / 2);
   const wmat = new THREE.MeshStandardNodeMaterial({ metalness: 0, roughness: 0.24 });
   wmat.transparent = true; wmat.depthWrite = false;
   wmat.polygonOffset = true; wmat.polygonOffsetFactor = -2; wmat.polygonOffsetUnits = -2; // z-fight緩和
-  const depth = texture(simTex, uv()).b;
-  const surfAt = (ox: number, oy: number) => groundAt(ox, oy).add(texture(simTex, uv().add(vec2(ox * demTexel, oy * demTexel))).b.mul(VERT_EXAG));
+  const depth = depthNode;
+  const surfAt = (ox: number, oy: number) => groundAt(ox, oy).add(waterAt(ox, oy).mul(VERT_EXAG));
   wmat.positionNode = positionLocal.add(vec3(0, surfAt(0, 0), 0));
 
-  // ── 流速(m/s)で水面を「流れて」見せる ──
-  const vel = texture(sim.velTex, uv()).xy;
-  const spd = vel.length();
-  const flowDir = nrm(vel.add(vec2(1e-4, 1e-4)));
-  // 流れ方向へ進む筋 (速い所ほど筋が立ち速く流れる)
+  // ── 水面を「流れて」見せる ──
+  // CPU: sim の流速テクスチャ / GPU: 地形勾配から下り方向を推定
+  let spd: any, flowDir: any;
+  if (USE_GPU) {
+    // 下り方向 = -勾配。勾配は地表高の近傍差から。
+    const grad = vec2(groundAt(1, 0).sub(groundAt(-1, 0)), groundAt(0, 1).sub(groundAt(0, -1)));
+    spd = grad.length().mul(0.3);
+    flowDir = nrm(grad.mul(-1).add(vec2(1e-4, 1e-4)));
+  } else {
+    const vel = texture(cpuSim!.velTex, uv()).xy;
+    spd = vel.length();
+    flowDir = nrm(vel.add(vec2(1e-4, 1e-4)));
+  }
   const proj = uv().x.mul(flowDir.x).add(uv().y.mul(flowDir.y));
   const flowScroll = proj.mul(700).sub(uTime.mul(spd.mul(1.6).add(0.5)));
   const flowWave = sin(flowScroll).mul(smoothstep(0.1, 1.2, spd)).mul(0.08);
@@ -224,12 +267,29 @@ async function main() {
   }
   applyControlMode();
 
+  // ── 統一シムAPI (GPU/CPU 共通) ──
+  const simRain = (r: number) => { if (USE_GPU) gpuSim!.rainRate = r; else cpuSim!.rainRate = r; };
+  const simBrush = (u: number, v: number, dtb: number, m: 'dig' | 'raise') => {
+    if (USE_GPU) gpuSim!.brush(u, v, dtb, m); else cpuSim!.brush(u, v, dtb, m);
+  };
+  // GPU レイキャスト用: 静的DEMのバイリニア標高 (変形は無視・ピック位置に十分)
+  const demHeightUV = (u: number, v: number) => {
+    const N = DEM_SIZE;
+    const fx = Math.min(Math.max(u, 0), 1) * (N - 1), fy = Math.min(Math.max(v, 0), 1) * (N - 1);
+    const i0 = Math.floor(fx), j0 = Math.floor(fy), i1 = Math.min(i0 + 1, N - 1), j1 = Math.min(j0 + 1, N - 1);
+    const tx = fx - i0, ty = fy - j0;
+    const hh = (i: number, j: number) => demH[j * N + i];
+    const a = hh(i0, j0) * (1 - tx) + hh(i1, j0) * tx, b = hh(i0, j1) * (1 - tx) + hh(i1, j1) * tx;
+    return a * (1 - ty) + b * ty;
+  };
+  const simHeightUV = (u: number, v: number) => (USE_GPU ? demHeightUV(u, v) : cpuSim!.surfaceHeightUV(u, v));
+
   const raycaster = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
   let sculpting = false;
   let mode: 'dig' | 'raise' = 'dig';
   const pointer = { x: 0, y: 0, has: false };
-  const sampleH = (x: number, z: number) => sim.surfaceHeightUV((x + worldW / 2) / worldW, 0.5 - z / worldW) * VERT_EXAG;
+  const sampleH = (x: number, z: number) => simHeightUV((x + worldW / 2) / worldW, 0.5 - z / worldW) * VERT_EXAG;
   function pickWorld(pxp: number, pyp: number): { x: number; z: number } | null {
     ndc.set((pxp / innerWidth) * 2 - 1, -(pyp / innerHeight) * 2 + 1);
     raycaster.setFromCamera(ndc, camera);
@@ -271,7 +331,7 @@ async function main() {
     if (!sculpting || !pointer.has) return;
     const hit = pickWorld(pointer.x, pointer.y);
     if (!hit) return;
-    sim.brush((hit.x + worldW / 2) / worldW, 0.5 - hit.z / worldW, Math.min(dt, 1 / 30), mode);
+    simBrush((hit.x + worldW / 2) / worldW, 0.5 - hit.z / worldW, Math.min(dt, 1 / 30), mode);
     settle = 60;
   }
 
@@ -287,14 +347,18 @@ async function main() {
   btnDig.addEventListener('click', () => { if (!sculptOn) { sculptOn = true; applyControlMode(); refreshLookBtn(); } setMode('dig'); });
   btnRaise.addEventListener('click', () => { if (!sculptOn) { sculptOn = true; applyControlMode(); refreshLookBtn(); } setMode('raise'); });
   btnRain.addEventListener('click', () => {
-    raining = !raining; sim.rainRate = raining ? 0.1 : 0;
+    raining = !raining; simRain(raining ? 0.1 : 0);
     if (raining) { everRained = true; } else { settle = 1800; }
     btnRain.textContent = `🌧 雨 ${raining ? 'ON' : 'OFF'}`; btnRain.classList.toggle('on', raining);
   });
   btnReset.addEventListener('click', () => {
-    sim.soil.fill(0); sim.water.fill(0); sim.wet.fill(0); sim.bedrock.set(simBed);
-    (sim as unknown as { terrainDirty: boolean }).terrainDirty = true;
-    sim.drained = 0; sim.injected = 0; raining = false; sim.rainRate = 0; everRained = false; settle = 2;
+    if (USE_GPU) { gpuSim!.reset(); } else {
+      cpuSim!.soil.fill(0); cpuSim!.water.fill(0); cpuSim!.wet.fill(0);
+      if (cpuInitBed) cpuSim!.bedrock.set(cpuInitBed);
+      (cpuSim as unknown as { terrainDirty: boolean }).terrainDirty = true;
+      cpuSim!.drained = 0; cpuSim!.injected = 0;
+    }
+    raining = false; simRain(0); everRained = false; settle = 2;
     btnRain.textContent = '🌧 雨 OFF'; btnRain.classList.remove('on');
   });
   refreshLookBtn();
@@ -316,20 +380,22 @@ async function main() {
     });
   }
 
+  const simN = USE_GPU ? DEM_SIZE : SIM_N;
   (window as unknown as { __geo: unknown }).__geo = {
-    sim, async render() { await renderer.renderAsync(scene, camera); },
+    gpuSim, cpuSim, useGpu: USE_GPU,
+    async render() { await renderer.renderAsync(scene, camera); },
     async brushAt(x: number, z: number, sec: number, m: 'dig' | 'raise' = 'dig') {
       const u = (x + worldW / 2) / worldW, v = 0.5 - z / worldW, f = Math.round(sec * 60);
-      for (let k = 0; k < f; k++) { sim.brush(u, v, 1 / 60, m); sim.step(1 / 60, 0); }
-      sim.sync(); await renderer.renderAsync(scene, camera);
+      for (let k = 0; k < f; k++) { simBrush(u, v, 1 / 60, m); if (USE_GPU) gpuSim!.step(0, true); else { cpuSim!.step(1 / 60, 0); cpuSim!.sync(); } }
+      await renderer.renderAsync(scene, camera);
     },
-    async rainFor(sec: number, rate = 0.12) {
-      sim.rainRate = rate; const f = Math.round(sec * 60);
-      for (let k = 0; k < f; k++) sim.step(1 / 60, 1);
-      sim.rainRate = 0; sim.sync(); await renderer.renderAsync(scene, camera);
+    async rainFor(sec: number, rate = 0.1) {
+      simRain(rate); const f = Math.round(sec * 60);
+      for (let k = 0; k < f; k++) { if (USE_GPU) gpuSim!.step(1, true); else { cpuSim!.step(1 / 60, 1); cpuSim!.sync(); } }
+      simRain(0); await renderer.renderAsync(scene, camera);
     },
-    totals: () => sim.totals(),
-    info: { worldW, hMin, hMax, cell: worldW / SIM_N, isTouch: IS_TOUCH, simN: SIM_N },
+    async totals() { return USE_GPU ? await gpuSim!.totals() : cpuSim!.totals(); },
+    info: { worldW, hMin, hMax, cell: worldW / simN, isTouch: IS_TOUCH, simN, useGpu: USE_GPU },
   };
 
   document.getElementById('hud')!.querySelector('b')!.textContent = `terra-touch — ${LOC.name_ja}`;
@@ -346,8 +412,12 @@ async function main() {
     const active = sculpting || raining || settle > 0;
     if (active) {
       applyBrush(dt);
-      sim.step(dt, (raining || everRained) ? 1 : 0);
-      sim.sync();
+      if (USE_GPU) {
+        gpuSim!.step((raining || everRained) ? 1 : 0, true);
+      } else {
+        cpuSim!.step(dt, (raining || everRained) ? 1 : 0);
+        cpuSim!.sync();
+      }
       if (!sculpting && !raining && settle > 0) settle--;
     }
 
@@ -356,8 +426,12 @@ async function main() {
     frames++;
     if (now - statLast >= 500) {
       fpsEl.textContent = `${Math.round((frames * 1000) / (now - statLast))} fps`;
-      const t = sim.totals();
-      drift.textContent = `土drift ${t.driftPct >= 0 ? '+' : ''}${t.driftPct.toFixed(2)}%${t.nan ? ' ⚠NaN' : ''}`;
+      if (USE_GPU) {
+        drift.textContent = `GPU ${simN}²`;
+      } else {
+        const t = cpuSim!.totals();
+        drift.textContent = `土drift ${t.driftPct >= 0 ? '+' : ''}${t.driftPct.toFixed(2)}%${t.nan ? ' ⚠NaN' : ''}`;
+      }
       frames = 0; statLast = now;
     }
   });

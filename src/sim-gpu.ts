@@ -12,7 +12,7 @@
 import * as THREE from 'three/webgpu';
 import {
   Fn, instanceIndex, instancedArray, uniform, select, float, int, uint,
-  vec2, vec4, max, min, length, sin,
+  vec2, vec4, uvec2, max, min, length, sin, textureStore,
 } from 'three/tsl';
 import { computeBrushNorm } from './brush-profile';
 
@@ -40,6 +40,8 @@ export class GpuSim {
   state: any;
   private flux: any;
   private slump: any;
+  private initStateBuf: any;
+  private kReset: any;
   private stateAttr: THREE.StorageInstancedBufferAttribute;
 
   // uniforms
@@ -63,6 +65,9 @@ export class GpuSim {
   private kSlump1: any;
   private kSlump2: any;
   private kBrush: any;
+  private kCopy: any;
+  // 表示用テクスチャ: [地表高(bed+soil), water, wet, 1]。毎ステップ末に buffer からコピー。
+  dispTex!: THREE.StorageTexture;
 
   constructor(renderer: THREE.WebGPURenderer, opts: GpuSimOpts) {
     this.renderer = renderer;
@@ -82,8 +87,16 @@ export class GpuSim {
     for (let k = 0; k < len; k++) initState[k * 4] = opts.bedrock[k];
     this.state = instancedArray(initState as unknown as number, 'vec4');
     this.stateAttr = (this.state as unknown as { value: THREE.StorageInstancedBufferAttribute }).value;
+    this.initStateBuf = instancedArray(initState.slice() as unknown as number, 'vec4'); // reset用の不変コピー
     this.flux = instancedArray(len, 'vec4');
     this.slump = instancedArray(len, 'vec4');
+
+    // 表示用 StorageTexture (rgba32f・textureLoad で整数座標読み=フィルタ不要でクッキリ)
+    this.dispTex = new THREE.StorageTexture(N, N);
+    this.dispTex.format = THREE.RGBAFormat;
+    this.dispTex.type = THREE.FloatType;
+    this.dispTex.minFilter = THREE.NearestFilter;
+    this.dispTex.magFilter = THREE.NearestFilter;
 
     this.setBrushRadius(this.brushRadius);
     this.buildKernels(N);
@@ -228,6 +241,27 @@ export class GpuSim {
       const soil = soilAfterTake.add(drop);
       state.element(instanceIndex).assign(vec4(bed, soil, s.z, s.w));
     })().compute(N * N);
+
+    // ── 表示テクスチャへコピー ([bed+soil, water, wet, 1]) ──
+    const dispTex = this.dispTex;
+    this.kCopy = Fn(() => {
+      const { i, j } = ijOf();
+      const s = state.element(instanceIndex);
+      textureStore(dispTex, uvec2(uint(i), uint(j)), vec4(s.x.add(s.y), s.z, s.w, float(1))).toWriteOnly();
+    })().compute(N * N);
+
+    // ── リセット (初期状態へ) ──
+    const initBuf = this.initStateBuf;
+    this.kReset = Fn(() => {
+      state.element(instanceIndex).assign(initBuf.element(instanceIndex));
+      flux.element(instanceIndex).assign(vec4(0, 0, 0, 0));
+    })().compute(N * N);
+  }
+
+  reset() {
+    this.rainRate = 0;
+    this.renderer.compute(this.kReset);
+    this.renderer.compute(this.kCopy);
   }
 
   /** 1 フレーム進める */
@@ -239,6 +273,7 @@ export class GpuSim {
       r.compute(this.kFlux);
       r.compute(this.kDepth);
     }
+    r.compute(this.kCopy); // 表示テクスチャ更新
   }
 
   /** ブラシ適用 (u,v=0..1) */
@@ -246,7 +281,11 @@ export class GpuSim {
     (this.uBrush.value as THREE.Vector4).set(u, v, this.brushRadius, this.digRate * dt);
     this.uBrushMode.value = mode === 'dig' ? 1 : -1;
     this.renderer.compute(this.kBrush);
+    this.renderer.compute(this.kCopy);
   }
+
+  /** dispTex を最新化 (初回描画前など) */
+  syncDisp() { this.renderer.compute(this.kCopy); }
 
   /** CPU へ state を読み戻して総量/NaN を確認 (検証用・重い) */
   async totals(): Promise<{ solid: number; water: number; nan: boolean }> {
