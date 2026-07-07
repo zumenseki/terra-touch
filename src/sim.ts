@@ -63,8 +63,10 @@ export class TerrainSim {
   private fD: Float32Array;
   private surf: Float32Array;
   private packed: Uint16Array;
+  private velPacked: Uint16Array; // 流速 (fR-fL, fD-fU) 可視化用
   private terrainDirty = true;
   tex: THREE.DataTexture;
+  velTex!: THREE.DataTexture;
 
   initialSolid = 0;
   injected = 0;
@@ -102,6 +104,7 @@ export class TerrainSim {
     this.fD = new Float32Array(len);
     this.surf = new Float32Array(len);
     this.packed = new Uint16Array(len * 4);
+    this.velPacked = new Uint16Array(len * 2);
 
     if (geo) {
       this.bedrock.set(opts.bedrock!.subarray(0, len));
@@ -125,6 +128,11 @@ export class TerrainSim {
     this.tex.magFilter = THREE.LinearFilter;
     this.tex.wrapS = THREE.ClampToEdgeWrapping;
     this.tex.wrapT = THREE.ClampToEdgeWrapping;
+    this.velTex = new THREE.DataTexture(this.velPacked, N, N, THREE.RGFormat, THREE.HalfFloatType);
+    this.velTex.minFilter = THREE.LinearFilter;
+    this.velTex.magFilter = THREE.LinearFilter;
+    this.velTex.wrapS = THREE.ClampToEdgeWrapping;
+    this.velTex.wrapT = THREE.ClampToEdgeWrapping;
     this.sync();
   }
 
@@ -416,6 +424,20 @@ export class TerrainSim {
       }
     }
     this.tex.needsUpdate = true;
+    // 物理流速 (m/s = 正味フラックス / (セル幅 × 水深))
+    const fL = this.fL, fR = this.fR, fU = this.fU, fD = this.fD, vp = this.velPacked;
+    const cell = this.cell;
+    for (let k = 0, o = 0; k < W.length; k++, o += 2) {
+      const d = W[k] > 0.05 ? W[k] : 0.05;
+      const inv = 1 / (cell * d);
+      let vx = (fR[k] - fL[k]) * inv;
+      let vz = (fD[k] - fU[k]) * inv;
+      const m = Math.hypot(vx, vz);
+      if (m > 8) { vx = (vx / m) * 8; vz = (vz / m) * 8; } // 過大流速をクランプ
+      vp[o] = toH(vx);
+      vp[o + 1] = toH(vz);
+    }
+    this.velTex.needsUpdate = true;
   }
 
   totals(): SimTotals {

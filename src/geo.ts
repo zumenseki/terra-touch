@@ -181,19 +181,32 @@ async function main() {
   const depth = texture(simTex, uv()).b;
   const surfAt = (ox: number, oy: number) => groundAt(ox, oy).add(texture(simTex, uv().add(vec2(ox * demTexel, oy * demTexel))).b.mul(VERT_EXAG));
   wmat.positionNode = positionLocal.add(vec3(0, surfAt(0, 0), 0));
-  // さざ波 (控えめ)
-  const rip = sin(uv().x.mul(170).add(uTime.mul(1.2))).add(sin(uv().y.mul(150).sub(uTime))).mul(0.04);
-  const wN = nrm(vec3(surfAt(-1, 0).sub(surfAt(1, 0)).add(rip), cell * 2, surfAt(0, 1).sub(surfAt(0, -1)).add(rip)));
+
+  // ── 流速(m/s)で水面を「流れて」見せる ──
+  const vel = texture(sim.velTex, uv()).xy;
+  const spd = vel.length();
+  const flowDir = nrm(vel.add(vec2(1e-4, 1e-4)));
+  // 流れ方向へ進む筋 (速い所ほど筋が立ち速く流れる)
+  const proj = uv().x.mul(flowDir.x).add(uv().y.mul(flowDir.y));
+  const flowScroll = proj.mul(700).sub(uTime.mul(spd.mul(1.6).add(0.5)));
+  const flowWave = sin(flowScroll).mul(smoothstep(0.1, 1.2, spd)).mul(0.14);
+  // 静水の微さざ波
+  const calm = sin(uv().x.mul(140).add(uTime.mul(0.8))).add(sin(uv().y.mul(120).sub(uTime.mul(0.7)))).mul(0.03);
+  const perturb = flowWave.add(calm);
+  const wN = nrm(vec3(surfAt(-1, 0).sub(surfAt(1, 0)).add(perturb), cell * 2, surfAt(0, 1).sub(surfAt(0, -1)).add(perturb)));
   wmat.normalNode = transformNormalToView(wN);
-  // 深さで色 + フレネルで空を映す(弱め)
-  const baseWater = mix(vec3(0.08, 0.22, 0.28), vec3(0.02, 0.06, 0.14), smoothstep(0.4, 8.0, depth));
+
+  // 深さで色 + フレネルで空 + 流れの速い所に白泡
+  const baseWater = mix(vec3(0.07, 0.20, 0.26), vec3(0.02, 0.06, 0.13), smoothstep(0.4, 8.0, depth));
   const fresnel = float(1).sub(smoothstep(0.2, 0.85, wN.y));
-  wmat.colorNode = mix(baseWater, vec3(0.46, 0.58, 0.72), fresnel.mul(0.35));
-  // 物理: 立った水は「平地」に「十分な深さ」でしか存在しない。
-  //   → 地形傾斜が急な所は水面を描かない(斜面の薄い流去水は膜として描かず、地形の濡れ表現のみ)。
+  const skyMix = mix(baseWater, vec3(0.46, 0.58, 0.72), fresnel.mul(0.35));
+  const foam = smoothstep(5.0, 8.0, spd).mul(0.15); // 最速部だけ薄く白波
+  wmat.colorNode = mix(skyMix, vec3(0.86, 0.91, 0.95), foam);
+
+  // ゲート: 深さ主体で川筋も見せる。ほぼ垂直な崖だけ膜を隠す。
   const gTerr = nrm(vec3(groundAt(-1, 0).sub(groundAt(1, 0)), cell * 2, groundAt(0, 1).sub(groundAt(0, -1))));
-  const flat = smoothstep(0.55, 0.9, gTerr.y); // 1=平地, 0=急斜面
-  wmat.opacityNode = smoothstep(0.3, 2.0, depth).mul(flat).mul(0.92);
+  const notCliff = smoothstep(0.26, 0.5, gTerr.y); // 崖(斜度~75°+)のみ0
+  wmat.opacityNode = smoothstep(0.12, 1.0, depth).mul(notCliff).mul(0.94);
   const waterMesh = new THREE.Mesh(wgeo, wmat);
   waterMesh.renderOrder = 1; scene.add(waterMesh);
 
@@ -273,7 +286,7 @@ async function main() {
   btnDig.addEventListener('click', () => { if (!sculptOn) { sculptOn = true; applyControlMode(); refreshLookBtn(); } setMode('dig'); });
   btnRaise.addEventListener('click', () => { if (!sculptOn) { sculptOn = true; applyControlMode(); refreshLookBtn(); } setMode('raise'); });
   btnRain.addEventListener('click', () => {
-    raining = !raining; sim.rainRate = raining ? 0.12 : 0;
+    raining = !raining; sim.rainRate = raining ? 0.1 : 0;
     if (raining) { everRained = true; } else { settle = 1800; }
     btnRain.textContent = `🌧 雨 ${raining ? 'ON' : 'OFF'}`; btnRain.classList.toggle('on', raining);
   });
