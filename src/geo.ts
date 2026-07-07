@@ -27,7 +27,7 @@ const VERT_EXAG = LOC.exag;
 
 // 端末に応じて負荷を調整
 const IS_TOUCH = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
-const SIM_N = IS_TOUCH ? 128 : 256;      // 1024 を割り切る値
+const SIM_N = IS_TOUCH ? 256 : 512; // 1024 を割り切る値 (シムは雨/彫る時のみ稼働=待機は60fps維持)      // 1024 を割り切る値
 const MESH_N = IS_TOUCH ? 512 : 768;
 const WATER_MESH = IS_TOUCH ? 384 : 512;
 const PIX_CAP = IS_TOUCH ? 1.5 : 2;
@@ -175,7 +175,7 @@ async function main() {
 
   const wgeo = new THREE.PlaneGeometry(worldW, worldW, WATER_MESH - 1, WATER_MESH - 1);
   wgeo.rotateX(-Math.PI / 2);
-  const wmat = new THREE.MeshStandardNodeMaterial({ metalness: 0, roughness: 0.13 });
+  const wmat = new THREE.MeshStandardNodeMaterial({ metalness: 0, roughness: 0.24 });
   wmat.transparent = true; wmat.depthWrite = false;
   wmat.polygonOffset = true; wmat.polygonOffsetFactor = -2; wmat.polygonOffsetUnits = -2; // z-fight緩和
   const depth = texture(simTex, uv()).b;
@@ -189,7 +189,7 @@ async function main() {
   // 流れ方向へ進む筋 (速い所ほど筋が立ち速く流れる)
   const proj = uv().x.mul(flowDir.x).add(uv().y.mul(flowDir.y));
   const flowScroll = proj.mul(700).sub(uTime.mul(spd.mul(1.6).add(0.5)));
-  const flowWave = sin(flowScroll).mul(smoothstep(0.1, 1.2, spd)).mul(0.14);
+  const flowWave = sin(flowScroll).mul(smoothstep(0.1, 1.2, spd)).mul(0.08);
   // 静水の微さざ波
   const calm = sin(uv().x.mul(140).add(uTime.mul(0.8))).add(sin(uv().y.mul(120).sub(uTime.mul(0.7)))).mul(0.03);
   const perturb = flowWave.add(calm);
@@ -197,16 +197,17 @@ async function main() {
   wmat.normalNode = transformNormalToView(wN);
 
   // 深さで色 + フレネルで空 + 流れの速い所に白泡
-  const baseWater = mix(vec3(0.07, 0.20, 0.26), vec3(0.02, 0.06, 0.13), smoothstep(0.4, 8.0, depth));
+  // 深い水は光を吸収=暗い。強い直射光(×3)で白飛びしないよう低アルベドに。
+  const baseWater = mix(vec3(0.035, 0.10, 0.13), vec3(0.008, 0.028, 0.06), smoothstep(0.4, 8.0, depth));
   const fresnel = float(1).sub(smoothstep(0.2, 0.85, wN.y));
-  const skyMix = mix(baseWater, vec3(0.46, 0.58, 0.72), fresnel.mul(0.35));
-  const foam = smoothstep(5.0, 8.0, spd).mul(0.15); // 最速部だけ薄く白波
-  wmat.colorNode = mix(skyMix, vec3(0.86, 0.91, 0.95), foam);
+  const skyMix = mix(baseWater, vec3(0.24, 0.34, 0.46), fresnel.mul(0.18)); // 山岳谷の反射は落ち着いた青灰
+  const foam = smoothstep(6.0, 8.0, spd).mul(0.12); // 最速部だけごく薄く白波
+  wmat.colorNode = mix(skyMix, vec3(0.82, 0.88, 0.93), foam);
 
   // ゲート: 深さ主体で川筋も見せる。ほぼ垂直な崖だけ膜を隠す。
   const gTerr = nrm(vec3(groundAt(-1, 0).sub(groundAt(1, 0)), cell * 2, groundAt(0, 1).sub(groundAt(0, -1))));
   const notCliff = smoothstep(0.26, 0.5, gTerr.y); // 崖(斜度~75°+)のみ0
-  wmat.opacityNode = smoothstep(0.12, 1.0, depth).mul(notCliff).mul(0.94);
+  wmat.opacityNode = smoothstep(0.18, 1.1, depth).mul(notCliff).mul(0.94);
   const waterMesh = new THREE.Mesh(wgeo, wmat);
   waterMesh.renderOrder = 1; scene.add(waterMesh);
 
