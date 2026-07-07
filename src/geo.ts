@@ -1,9 +1,9 @@
-// terra-touch geo — 実衛星画像 × 実DEM を指で変形するサンドボックス。
-// 「Google Earth を指でいじる」本体。
+// terra-touch geo — 実衛星画像 × 実DEM を指で変形するサンドボックス (PC/スマホ両対応)。
 //   - 衛星画像(ESRI/Maxar)=色、実DEM(AWS Terrain)=標高 (どちらもトークン不要/CORS)。
-//   - 実DEM は sim(256²) の bedrock に注入 = 実地形は不動。押した所だけ bedrock→soil(可動)へ。
-//   - 描画メッシュ(1024²) の標高 = 高精細DEM + sim差分(delta)。ディテール維持+変形反映。
-//   - 水は既定OFF。「雨」で全面降雨 → 実富士の谷に水が集まる。
+//   - 実DEM は sim の bedrock に注入 = 実地形は不動。押した所だけ soil化して安息角で崩れる。
+//   - 描画メッシュ = 高精細DEM + sim差分。水は既定OFF、「雨」で実谷に集まる。
+//   - スマホ: 1本指=見る(回転)/2本指=ズーム。「彫る」ボタンで1本指を変形に切替。
+//     静止時はシム停止で軽量。
 
 import * as THREE from 'three/webgpu';
 import {
@@ -15,8 +15,16 @@ import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { TerrainSim } from './sim';
 
 const LAT = 35.3606, LON = 138.7274, ZOOM = 13, GRID = 4, TILE = 256;
-const DEM_SIZE = GRID * TILE, SIM_N = 256, MESH_N = 1024, VERT_EXAG = 1.0;
+const DEM_SIZE = GRID * TILE;
 const EARTH_C = 40075016.686;
+const VERT_EXAG = 1.0;
+
+// 端末に応じて負荷を調整
+const IS_TOUCH = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+const SIM_N = IS_TOUCH ? 128 : 256;      // 1024 を割り切る値
+const MESH_N = IS_TOUCH ? 512 : 1024;
+const WATER_MESH = IS_TOUCH ? 384 : 512;
+const PIX_CAP = IS_TOUCH ? 1.5 : 2;
 
 const status = document.getElementById('status')!;
 const lon2tile = (lon: number, z: number) => ((lon + 180) / 360) * 2 ** z;
@@ -55,12 +63,12 @@ async function fetchMosaic(kind: 'img' | 'dem', xMin: number, yMin: number) {
 }
 
 async function main() {
-  const renderer = new THREE.WebGPURenderer({ antialias: true });
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  const renderer = new THREE.WebGPURenderer({ antialias: !IS_TOUCH });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, PIX_CAP));
   renderer.setSize(innerWidth, innerHeight);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
-  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.enabled = !IS_TOUCH;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   document.body.appendChild(renderer.domElement);
   await renderer.init();
@@ -125,8 +133,6 @@ async function main() {
   controls.enableDamping = true;
   controls.maxPolarAngle = Math.PI * 0.495;
   controls.minDistance = worldW * 0.02; controls.maxDistance = worldW * 2.5;
-  controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE };
-  controls.touches = { ONE: null, TWO: THREE.TOUCH.DOLLY_PAN };
 
   const sun = new THREE.Vector3().setFromSphericalCoords(1, Math.PI / 2 - THREE.MathUtils.degToRad(34), THREE.MathUtils.degToRad(150));
   const sky = new SkyMesh();
@@ -137,11 +143,14 @@ async function main() {
 
   const dir = new THREE.DirectionalLight(0xfff4e6, 3.0);
   dir.position.copy(sun).multiplyScalar(worldW);
-  dir.castShadow = true; dir.shadow.mapSize.set(4096, 4096);
-  const dsc = dir.shadow.camera; const rr = worldW * 0.7;
-  dsc.left = -rr; dsc.right = rr; dsc.top = rr; dsc.bottom = -rr;
-  dsc.near = worldW * 0.1; dsc.far = worldW * 3;
-  dir.shadow.bias = -0.0003; dir.shadow.normalBias = worldW * 0.002; scene.add(dir);
+  if (!IS_TOUCH) {
+    dir.castShadow = true; dir.shadow.mapSize.set(4096, 4096);
+    const dsc = dir.shadow.camera; const rr = worldW * 0.7;
+    dsc.left = -rr; dsc.right = rr; dsc.top = rr; dsc.bottom = -rr;
+    dsc.near = worldW * 0.1; dsc.far = worldW * 3;
+    dir.shadow.bias = -0.0003; dir.shadow.normalBias = worldW * 0.002;
+  }
+  scene.add(dir);
   scene.add(new THREE.HemisphereLight(0xbcd2ee, 0x4a4238, 0.55));
 
   const demTexel = 1 / DEM_SIZE;
@@ -162,9 +171,9 @@ async function main() {
   const photo = texture(imgTex, uv()).mul(shade);
   mat.colorNode = mix(photo, photo.mul(0.5), smoothstep(0.05, 0.8, wetA));
   const terrain = new THREE.Mesh(geo, mat);
-  terrain.castShadow = true; terrain.receiveShadow = true; scene.add(terrain);
+  terrain.castShadow = !IS_TOUCH; terrain.receiveShadow = !IS_TOUCH; scene.add(terrain);
 
-  const wgeo = new THREE.PlaneGeometry(worldW, worldW, 511, 511);
+  const wgeo = new THREE.PlaneGeometry(worldW, worldW, WATER_MESH - 1, WATER_MESH - 1);
   wgeo.rotateX(-Math.PI / 2);
   const wmat = new THREE.MeshStandardNodeMaterial({ metalness: 0, roughness: 0.07 });
   wmat.transparent = true; wmat.depthWrite = false;
@@ -178,6 +187,19 @@ async function main() {
   wmat.opacityNode = smoothstep(0.06, 0.8, depth).mul(0.9);
   const waterMesh = new THREE.Mesh(wgeo, wmat);
   waterMesh.renderOrder = 1; scene.add(waterMesh);
+
+  // ── 操作モード: 見る(回転) / 彫る ──
+  let sculptOn = !IS_TOUCH; // PCは既定で彫る、スマホは既定で見る
+  function applyControlMode() {
+    if (sculptOn) {
+      controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE };
+      controls.touches = { ONE: null, TWO: THREE.TOUCH.DOLLY_PAN };
+    } else {
+      controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE };
+      controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+    }
+  }
+  applyControlMode();
 
   const raycaster = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
@@ -208,6 +230,7 @@ async function main() {
 
   const canvas = renderer.domElement;
   canvas.addEventListener('pointerdown', (e) => {
+    if (!sculptOn) return;
     if (e.button !== 0 && e.pointerType === 'mouse') return;
     sculpting = true; pointer.x = e.offsetX; pointer.y = e.offsetY; pointer.has = true;
     canvas.setPointerCapture(e.pointerId);
@@ -217,31 +240,41 @@ async function main() {
   canvas.addEventListener('pointerup', endS);
   canvas.addEventListener('pointercancel', endS);
 
+  // ── シム稼働の間引き (静止時は止めて軽量) ──
+  let settle = 0;         // >0 の間はシムを回す
+  let everRained = false; // 一度でも雨→水を回し続ける
+
   function applyBrush(dt: number) {
     if (!sculpting || !pointer.has) return;
     const hit = pickWorld(pointer.x, pointer.y);
     if (!hit) return;
     sim.brush((hit.x + worldW / 2) / worldW, 0.5 - hit.z / worldW, Math.min(dt, 1 / 30), mode);
+    settle = 60;
   }
 
   let raining = false;
+  const btnLook = document.getElementById('look')!;
   const btnDig = document.getElementById('mode-dig')!;
   const btnRaise = document.getElementById('mode-raise')!;
   const btnRain = document.getElementById('rain')!;
   const btnReset = document.getElementById('reset')!;
   const setMode = (m: 'dig' | 'raise') => { mode = m; btnDig.classList.toggle('on', m === 'dig'); btnRaise.classList.toggle('on', m === 'raise'); };
-  btnDig.addEventListener('click', () => setMode('dig'));
-  btnRaise.addEventListener('click', () => setMode('raise'));
+  const refreshLookBtn = () => { btnLook.textContent = sculptOn ? '✏️ 彫るモード' : '🖐 見るモード'; btnLook.classList.toggle('on', sculptOn); };
+  btnLook.addEventListener('click', () => { sculptOn = !sculptOn; applyControlMode(); refreshLookBtn(); });
+  btnDig.addEventListener('click', () => { if (!sculptOn) { sculptOn = true; applyControlMode(); refreshLookBtn(); } setMode('dig'); });
+  btnRaise.addEventListener('click', () => { if (!sculptOn) { sculptOn = true; applyControlMode(); refreshLookBtn(); } setMode('raise'); });
   btnRain.addEventListener('click', () => {
     raining = !raining; sim.rainRate = raining ? 0.9 : 0;
+    if (raining) { everRained = true; } else { settle = 1200; }
     btnRain.textContent = `🌧 雨 ${raining ? 'ON' : 'OFF'}`; btnRain.classList.toggle('on', raining);
   });
   btnReset.addEventListener('click', () => {
     sim.soil.fill(0); sim.water.fill(0); sim.wet.fill(0); sim.bedrock.set(simBed);
     (sim as unknown as { terrainDirty: boolean }).terrainDirty = true;
-    sim.drained = 0; sim.injected = 0; raining = false; sim.rainRate = 0;
+    sim.drained = 0; sim.injected = 0; raining = false; sim.rainRate = 0; everRained = false; settle = 2;
     btnRain.textContent = '🌧 雨 OFF'; btnRain.classList.remove('on');
   });
+  refreshLookBtn();
 
   (window as unknown as { __geo: unknown }).__geo = {
     sim, async render() { await renderer.renderAsync(scene, camera); },
@@ -256,22 +289,29 @@ async function main() {
       sim.rainRate = 0; sim.sync(); await renderer.renderAsync(scene, camera);
     },
     totals: () => sim.totals(),
-    info: { worldW, hMin, hMax, cell: worldW / SIM_N },
+    info: { worldW, hMin, hMax, cell: worldW / SIM_N, isTouch: IS_TOUCH, simN: SIM_N },
   };
 
   document.getElementById('hud')!.querySelector('b')!.textContent = 'terra-touch geo — 富士山 (実写・変形可)';
   const fpsEl = document.getElementById('fps')!;
   const drift = document.getElementById('drift')!;
-  status.textContent = `${(worldW / 1000).toFixed(0)}km四方 · 標高${hMin.toFixed(0)}〜${hMax.toFixed(0)}m · セル${(worldW / SIM_N).toFixed(0)}m`;
+  status.textContent = `${(worldW / 1000).toFixed(0)}km四方 · 標高${hMin.toFixed(0)}〜${hMax.toFixed(0)}m · ${IS_TOUCH ? 'スマホ' : 'PC'}`;
 
   let frames = 0, last = performance.now(), statLast = last;
   renderer.setAnimationLoop(() => {
     const now = performance.now();
     const dt = Math.min((now - last) / 1000, 1 / 20);
     last = now; uTime.value += dt;
-    applyBrush(dt);
-    sim.step(dt, raining ? 1 : 0);
-    sim.sync();
+
+    const active = sculpting || raining || settle > 0;
+    if (active) {
+      applyBrush(dt);
+      sim.step(dt, (raining || everRained) ? 1 : 0);
+      sim.sync();
+      if (!sculpting && !raining && settle > 0) settle--;
+      uTime.value += 0; // 水の波は active 中のみ更新で十分
+    }
+
     controls.update();
     renderer.render(scene, camera);
     frames++;

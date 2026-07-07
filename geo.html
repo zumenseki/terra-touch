@@ -2,39 +2,43 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
   <title>terra-touch geo — 実写地形を指でいじる</title>
   <style>
-    html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0e14; font-family: system-ui, sans-serif; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0e14;
+      font-family: system-ui, sans-serif; -webkit-user-select: none; user-select: none;
+      touch-action: none; overscroll-behavior: none; }
     #hud {
-      position: fixed; top: 10px; left: 10px; color: #fff;
-      background: rgba(0,0,0,.45); padding: 8px 12px; border-radius: 8px;
-      font-size: 12px; line-height: 1.6; pointer-events: none; user-select: none; max-width: 62ch;
+      position: fixed; top: 8px; left: 8px; right: 8px; color: #fff;
+      background: rgba(0,0,0,.45); padding: 7px 10px; border-radius: 8px;
+      font-size: 11px; line-height: 1.5; pointer-events: none;
     }
-    #hud b { font-size: 13px; }
-    #attr { position: fixed; bottom: 6px; right: 8px; color: #cfd; font-size: 10px;
-      background: rgba(0,0,0,.4); padding: 3px 7px; border-radius: 5px; }
-    #tools { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
-      display: flex; gap: 8px; }
-    #tools button { font-size: 14px; padding: 8px 14px; border-radius: 10px;
-      border: 1px solid rgba(255,255,255,.25); background: rgba(0,0,0,.5); color: #eee;
-      cursor: pointer; backdrop-filter: blur(4px); }
-    #tools button.on { background: #2c7; color: #062; border-color: #2c7; font-weight: 700; }
+    #hud b { font-size: 12px; }
+    #attr { position: fixed; bottom: 2px; right: 4px; color: #cfd; font-size: 9px;
+      background: rgba(0,0,0,.35); padding: 2px 5px; border-radius: 4px; pointer-events: none; }
+    #tools { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; max-width: 96vw; }
+    #tools button { font-size: 15px; padding: 11px 16px; border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.28); background: rgba(0,0,0,.55); color: #eee;
+      cursor: pointer; backdrop-filter: blur(4px); -webkit-tap-highlight-color: transparent; }
+    #tools button.on { background: #2c7; color: #052; border-color: #2c7; font-weight: 700; }
+    #look { min-width: 128px; }
   </style>
 </head>
 <body>
   <div id="hud">
-    <b>terra-touch geo</b><br>
-    左ドラッグ=地面を彫る/盛る · 右ドラッグ=回転 · ホイール=ズーム · 中ドラッグ=移動<br>
-    <span id="fps">-</span> · <span id="drift">土drift -</span> · <span id="status">読み込み中…</span>
+    <b>terra-touch geo</b> ·
+    <span id="fps">-</span> · <span id="drift">土drift -</span> · <span id="status">読み込み中…</span><br>
+    <span id="tip">スマホ: 1本指=回転 / 2本指=ズーム。「彫る」を押すと1本指で地面を変形。</span>
   </div>
   <div id="tools">
+    <button id="look">🖐 見るモード</button>
     <button id="mode-dig" class="on">⛏ 掘る</button>
     <button id="mode-raise">⛰ 盛る</button>
     <button id="rain">🌧 雨 OFF</button>
-    <button id="reset">↺ 元に戻す</button>
+    <button id="reset">↺ 戻す</button>
   </div>
-  <div id="attr">Imagery © Esri, Maxar, Earthstar Geographics · Elevation: AWS Terrain Tiles / Mapzen</div>
+  <div id="attr">Imagery © Esri, Maxar · Elevation: AWS Terrain Tiles / Mapzen</div>
   <script type="module" src="/src/geo.ts"></script>
 </body>
 </html>
