@@ -23,6 +23,10 @@
       cursor: pointer; backdrop-filter: blur(4px); -webkit-tap-highlight-color: transparent; }
     #tools button.on { background: #2c7; color: #052; border-color: #2c7; font-weight: 700; }
     #look { min-width: 128px; }
+    #loc-wrap { position: fixed; top: 8px; right: 8px; }
+    #loc-select { font-size: 15px; padding: 9px 12px; border-radius: 10px;
+      background: rgba(0,0,0,.6); color: #fff; border: 1px solid rgba(255,255,255,.3);
+      max-width: 46vw; -webkit-appearance: none; appearance: none; }
   </style>
 </head>
 <body>
@@ -38,6 +42,7 @@
     <button id="rain">🌧 雨 OFF</button>
     <button id="reset">↺ 戻す</button>
   </div>
+  <div id="loc-wrap"><select id="loc-select" aria-label="場所を選ぶ"></select></div>
   <div id="attr">Imagery © Esri, Maxar · Elevation: AWS Terrain Tiles / Mapzen</div>
   <script type="module" src="/src/geo.ts"></script>
 </body>

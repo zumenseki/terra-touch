@@ -13,16 +13,22 @@ import {
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { TerrainSim } from './sim';
+import { LOCATIONS, pickLocation, computeZoom } from './locations';
 
-const LAT = 35.3606, LON = 138.7274, ZOOM = 13, GRID = 4, TILE = 256;
+const GRID = 4, TILE = 256;
 const DEM_SIZE = GRID * TILE;
 const EARTH_C = 40075016.686;
-const VERT_EXAG = 1.0;
+
+// URL の ?loc= で場所を選択 (既定=富士)
+const LOC = pickLocation(new URLSearchParams(location.search).get('loc'));
+const LAT = LOC.lat, LON = LOC.lon;
+const ZOOM = computeZoom(LAT, LOC.extentKm, GRID);
+const VERT_EXAG = LOC.exag;
 
 // 端末に応じて負荷を調整
 const IS_TOUCH = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
 const SIM_N = IS_TOUCH ? 128 : 256;      // 1024 を割り切る値
-const MESH_N = IS_TOUCH ? 512 : 1024;
+const MESH_N = IS_TOUCH ? 512 : 768;
 const WATER_MESH = IS_TOUCH ? 384 : 512;
 const PIX_CAP = IS_TOUCH ? 1.5 : 2;
 
@@ -68,8 +74,9 @@ async function main() {
   renderer.setSize(innerWidth, innerHeight);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
-  renderer.shadowMap.enabled = !IS_TOUCH;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  // リアルタイム影は無効。衛星画像に既に影が焼き込まれており二重影になる上に重い。
+  // 起伏は法線ベースの陰影(shade)で表現する。
+  renderer.shadowMap.enabled = false;
   document.body.appendChild(renderer.domElement);
   await renderer.init();
 
@@ -143,13 +150,6 @@ async function main() {
 
   const dir = new THREE.DirectionalLight(0xfff4e6, 3.0);
   dir.position.copy(sun).multiplyScalar(worldW);
-  if (!IS_TOUCH) {
-    dir.castShadow = true; dir.shadow.mapSize.set(4096, 4096);
-    const dsc = dir.shadow.camera; const rr = worldW * 0.7;
-    dsc.left = -rr; dsc.right = rr; dsc.top = rr; dsc.bottom = -rr;
-    dsc.near = worldW * 0.1; dsc.far = worldW * 3;
-    dir.shadow.bias = -0.0003; dir.shadow.normalBias = worldW * 0.002;
-  }
   scene.add(dir);
   scene.add(new THREE.HemisphereLight(0xbcd2ee, 0x4a4238, 0.55));
 
@@ -171,7 +171,7 @@ async function main() {
   const photo = texture(imgTex, uv()).mul(shade);
   mat.colorNode = mix(photo, photo.mul(0.5), smoothstep(0.05, 0.8, wetA));
   const terrain = new THREE.Mesh(geo, mat);
-  terrain.castShadow = !IS_TOUCH; terrain.receiveShadow = !IS_TOUCH; scene.add(terrain);
+  scene.add(terrain);
 
   const wgeo = new THREE.PlaneGeometry(worldW, worldW, WATER_MESH - 1, WATER_MESH - 1);
   wgeo.rotateX(-Math.PI / 2);
@@ -183,8 +183,12 @@ async function main() {
   const rip = sin(uv().x.mul(400).add(uTime.mul(1.5))).add(sin(uv().y.mul(360).sub(uTime.mul(1.2)))).mul(0.08);
   const wN = nrm(vec3(surfAt(-1, 0).sub(surfAt(1, 0)).add(rip), cell * 2, surfAt(0, 1).sub(surfAt(0, -1)).add(rip)));
   wmat.normalNode = transformNormalToView(wN);
-  wmat.colorNode = mix(vec3(0.10, 0.30, 0.34), vec3(0.02, 0.08, 0.19), smoothstep(0.3, 6.0, depth));
-  wmat.opacityNode = smoothstep(0.06, 0.8, depth).mul(0.9);
+  // 深さで色(浅=青緑透明/深=濃紺) + フレネルで空を映し込む
+  const baseWater = mix(vec3(0.09, 0.26, 0.32), vec3(0.02, 0.07, 0.17), smoothstep(0.3, 6.0, depth));
+  const fresnel = float(1).sub(smoothstep(0.15, 0.9, wN.y)); // 斜め=反射強
+  const skyRefl = vec3(0.52, 0.66, 0.82);
+  wmat.colorNode = mix(baseWater, skyRefl, fresnel.mul(0.55));
+  wmat.opacityNode = mix(float(0.5), float(0.96), smoothstep(0.05, 1.2, depth));
   const waterMesh = new THREE.Mesh(wgeo, wmat);
   waterMesh.renderOrder = 1; scene.add(waterMesh);
 
@@ -276,6 +280,23 @@ async function main() {
   });
   refreshLookBtn();
 
+  // ── 場所セレクタ ──
+  const locSel = document.getElementById('loc-select') as HTMLSelectElement | null;
+  if (locSel) {
+    locSel.innerHTML = '';
+    for (const l of LOCATIONS) {
+      const opt = document.createElement('option');
+      opt.value = l.key; opt.textContent = l.name_ja;
+      if (l.key === LOC.key) opt.selected = true;
+      locSel.appendChild(opt);
+    }
+    locSel.addEventListener('change', () => {
+      const p = new URLSearchParams(location.search);
+      p.set('loc', locSel.value);
+      location.search = p.toString(); // 再読み込みで新しい場所をロード
+    });
+  }
+
   (window as unknown as { __geo: unknown }).__geo = {
     sim, async render() { await renderer.renderAsync(scene, camera); },
     async brushAt(x: number, z: number, sec: number, m: 'dig' | 'raise' = 'dig') {
@@ -292,7 +313,7 @@ async function main() {
     info: { worldW, hMin, hMax, cell: worldW / SIM_N, isTouch: IS_TOUCH, simN: SIM_N },
   };
 
-  document.getElementById('hud')!.querySelector('b')!.textContent = 'terra-touch geo — 富士山 (実写・変形可)';
+  document.getElementById('hud')!.querySelector('b')!.textContent = `terra-touch — ${LOC.name_ja}`;
   const fpsEl = document.getElementById('fps')!;
   const drift = document.getElementById('drift')!;
   status.textContent = `${(worldW / 1000).toFixed(0)}km四方 · 標高${hMin.toFixed(0)}〜${hMax.toFixed(0)}m · ${IS_TOUCH ? 'スマホ' : 'PC'}`;
@@ -309,7 +330,6 @@ async function main() {
       sim.step(dt, (raining || everRained) ? 1 : 0);
       sim.sync();
       if (!sculpting && !raining && settle > 0) settle--;
-      uTime.value += 0; // 水の波は active 中のみ更新で十分
     }
 
     controls.update();
