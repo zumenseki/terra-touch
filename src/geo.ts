@@ -1,30 +1,24 @@
-// terra-touch geo POC — 実衛星画像 × 実標高DEM を読み込んで表示する。
-// これが「Google Earth を指でいじる」の土台: 本物の写真を本物の地形に貼る。
-// 変形シム (brush/water) は次段でこの実 DEM ハイトフィールド上に載せる。
-//
-// データ源 (どちらも API キー不要 / CORS 対応):
-//   衛星画像 = ESRI World Imagery (© Esri, Maxar)   z/y/x
-//   標高DEM  = AWS Terrain Tiles / terrarium PNG      z/x/y  (h = R*256 + G + B/256 - 32768 m)
+// terra-touch geo — 実衛星画像 × 実DEM を指で変形するサンドボックス。
+// 「Google Earth を指でいじる」本体。
+//   - 衛星画像(ESRI/Maxar)=色、実DEM(AWS Terrain)=標高 (どちらもトークン不要/CORS)。
+//   - 実DEM は sim(256²) の bedrock に注入 = 実地形は不動。押した所だけ bedrock→soil(可動)へ。
+//   - 描画メッシュ(1024²) の標高 = 高精細DEM + sim差分(delta)。ディテール維持+変形反映。
+//   - 水は既定OFF。「雨」で全面降雨 → 実富士の谷に水が集まる。
 
 import * as THREE from 'three/webgpu';
 import {
   texture, uv, vec2, vec3, float, mix, smoothstep,
-  normalize as nrm, positionLocal, transformNormalToView,
+  normalize as nrm, positionLocal, transformNormalToView, uniform, sin,
 } from 'three/tsl';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
+import { TerrainSim } from './sim';
 
-// ── 表示する場所 (富士山) ──
-const LAT = 35.3606;
-const LON = 138.7274;
-const ZOOM = 12;
-const GRID = 6;        // GRID×GRID タイル (z12 で約48km四方)
-const TILE = 256;
-const VERT_EXAG = 1.35; // 立体感を少し強調 (1.0=実スケール)
+const LAT = 35.3606, LON = 138.7274, ZOOM = 13, GRID = 4, TILE = 256;
+const DEM_SIZE = GRID * TILE, SIM_N = 256, MESH_N = 1024, VERT_EXAG = 1.0;
+const EARTH_C = 40075016.686;
 
-const EARTH_C = 40075016.686; // 赤道円周 m
 const status = document.getElementById('status')!;
-
 const lon2tile = (lon: number, z: number) => ((lon + 180) / 360) * 2 ** z;
 const lat2tile = (lat: number, z: number) => {
   const r = (lat * Math.PI) / 180;
@@ -37,11 +31,9 @@ async function fetchBitmap(url: string): Promise<ImageBitmap> {
   return createImageBitmap(await res.blob());
 }
 
-/** GRID×GRID のタイルを取得し 1枚のキャンバスに合成 */
 async function fetchMosaic(kind: 'img' | 'dem', xMin: number, yMin: number) {
-  const size = GRID * TILE;
   const canvas = document.createElement('canvas');
-  canvas.width = size; canvas.height = size;
+  canvas.width = DEM_SIZE; canvas.height = DEM_SIZE;
   const ctx = canvas.getContext('2d', { willReadFrequently: kind === 'dem' })!;
   const jobs: Promise<void>[] = [];
   let done = 0;
@@ -52,18 +44,14 @@ async function fetchMosaic(kind: 'img' | 'dem', xMin: number, yMin: number) {
       const url = kind === 'img'
         ? `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${ZOOM}/${y}/${x}`
         : `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${ZOOM}/${x}/${y}.png`;
-      jobs.push(
-        fetchBitmap(url).then((bmp) => {
-          ctx.drawImage(bmp, dx * TILE, dy * TILE);
-          bmp.close();
-          done++;
-          status.textContent = `${kind === 'img' ? '衛星画像' : '標高'} ${done}/${total} タイル…`;
-        }),
-      );
+      jobs.push(fetchBitmap(url).then((bmp) => {
+        ctx.drawImage(bmp, dx * TILE, dy * TILE); bmp.close();
+        done++; status.textContent = `${kind === 'img' ? '衛星画像' : '標高'} ${done}/${total}…`;
+      }));
     }
   }
   await Promise.all(jobs);
-  return { canvas, ctx, size };
+  return { canvas, ctx };
 }
 
 async function main() {
@@ -77,128 +65,222 @@ async function main() {
   document.body.appendChild(renderer.domElement);
   await renderer.init();
 
-  // タイル範囲 (中心を GRID の中央へ)
-  const cx = lon2tile(LON, ZOOM);
-  const cy = lat2tile(LAT, ZOOM);
-  const xMin = Math.floor(cx - GRID / 2);
-  const yMin = Math.floor(cy - GRID / 2);
-
-  // 衛星画像と DEM を並行取得
+  const cx = lon2tile(LON, ZOOM), cy = lat2tile(LAT, ZOOM);
+  const xMin = Math.floor(cx - GRID / 2), yMin = Math.floor(cy - GRID / 2);
   const [img, dem] = await Promise.all([fetchMosaic('img', xMin, yMin), fetchMosaic('dem', xMin, yMin)]);
   status.textContent = '地形を構築中…';
 
-  // DEM 復号 (terrarium) → メートル標高
-  const { ctx: dctx, size } = dem;
-  const px = dctx.getImageData(0, 0, size, size).data;
-  const heights = new Float32Array(size * size);
+  const px = dem.ctx.getImageData(0, 0, DEM_SIZE, DEM_SIZE).data;
+  const demH = new Float32Array(DEM_SIZE * DEM_SIZE);
   let hMin = Infinity, hMax = -Infinity;
-  for (let k = 0, p = 0; k < size * size; k++, p += 4) {
+  for (let k = 0, p = 0; k < demH.length; k++, p += 4) {
     const h = px[p] * 256 + px[p + 1] + px[p + 2] / 256 - 32768;
-    heights[k] = h;
-    if (h < hMin) hMin = h;
-    if (h > hMax) hMax = h;
+    demH[k] = h; if (h < hMin) hMin = h; if (h > hMax) hMax = h;
   }
 
-  // ワールド寸法 (web mercator メートル → cos(lat) で地上メートルへ)
   const latR = (LAT * Math.PI) / 180;
-  const mercTile = EARTH_C / 2 ** ZOOM;
-  const worldW = mercTile * GRID * Math.cos(latR); // 一辺 m
+  const worldW = (EARTH_C / 2 ** ZOOM) * GRID * Math.cos(latR);
 
-  // 標高テクスチャ (fp16・メートル)
-  const half = new Uint16Array(size * size);
-  for (let k = 0; k < heights.length; k++) half[k] = THREE.DataUtils.toHalfFloat(heights[k]);
-  const heightTex = new THREE.DataTexture(half, size, size, THREE.RedFormat, THREE.HalfFloatType);
-  heightTex.minFilter = THREE.LinearFilter;
-  heightTex.magFilter = THREE.LinearFilter;
-  heightTex.needsUpdate = true;
+  const factor = DEM_SIZE / SIM_N;
+  const simBed = new Float32Array(SIM_N * SIM_N);
+  for (let j = 0; j < SIM_N; j++) for (let i = 0; i < SIM_N; i++) {
+    let acc = 0;
+    for (let bj = 0; bj < factor; bj++) { const sj = j * factor + bj; for (let bi = 0; bi < factor; bi++) acc += demH[sj * DEM_SIZE + (i * factor + bi)]; }
+    simBed[j * SIM_N + i] = acc / (factor * factor);
+  }
 
-  // 衛星画像テクスチャ
+  const sim = new TerrainSim({ n: SIM_N, world: worldW, bedrock: simBed });
+
+  const toHalf = THREE.DataUtils.toHalfFloat;
+  const baseHalf = new Uint16Array(demH.length);
+  for (let k = 0; k < demH.length; k++) baseHalf[k] = toHalf(demH[k]);
+  const baseDemTex = new THREE.DataTexture(baseHalf, DEM_SIZE, DEM_SIZE, THREE.RedFormat, THREE.HalfFloatType);
+  baseDemTex.minFilter = baseDemTex.magFilter = THREE.LinearFilter;
+  baseDemTex.wrapS = baseDemTex.wrapT = THREE.ClampToEdgeWrapping; baseDemTex.needsUpdate = true;
+
+  const simBaseHalf = new Uint16Array(simBed.length);
+  for (let k = 0; k < simBed.length; k++) simBaseHalf[k] = toHalf(simBed[k]);
+  const simBaseTex = new THREE.DataTexture(simBaseHalf, SIM_N, SIM_N, THREE.RedFormat, THREE.HalfFloatType);
+  simBaseTex.minFilter = simBaseTex.magFilter = THREE.LinearFilter;
+  simBaseTex.wrapS = simBaseTex.wrapT = THREE.ClampToEdgeWrapping; simBaseTex.needsUpdate = true;
+
+  const simTex = sim.tex;
+
   const imgTex = new THREE.CanvasTexture(img.canvas);
   imgTex.colorSpace = THREE.SRGBColorSpace;
-  imgTex.minFilter = THREE.LinearMipmapLinearFilter;
-  imgTex.magFilter = THREE.LinearFilter;
+  imgTex.minFilter = THREE.LinearMipmapLinearFilter; imgTex.magFilter = THREE.LinearFilter;
   imgTex.generateMipmaps = true;
   imgTex.anisotropy = renderer.getMaxAnisotropy?.() ?? 8;
 
-  // ── シーン ──
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x9fb8d4);
-  scene.fog = new THREE.Fog(0xaec4dd, worldW * 0.6, worldW * 2.2);
+  scene.fog = new THREE.Fog(0xaec4dd, worldW * 0.7, worldW * 2.4);
+  const uTime = uniform(0);
 
   const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 1, worldW * 6);
-  camera.position.set(worldW * 0.42, (hMax - hMin) * VERT_EXAG + worldW * 0.3, worldW * 0.55);
+  camera.position.set(worldW * 0.36, (hMax - hMin) * VERT_EXAG + worldW * 0.28, worldW * 0.5);
 
   const controls = new OrbitControls(camera, renderer.domElement);
-  controls.target.set(0, (hMax * 0.4 - hMin) * VERT_EXAG, 0);
+  controls.target.set(0, hMax * 0.35 * VERT_EXAG, 0);
   controls.enableDamping = true;
   controls.maxPolarAngle = Math.PI * 0.495;
-  controls.minDistance = worldW * 0.03;
-  controls.maxDistance = worldW * 2.5;
+  controls.minDistance = worldW * 0.02; controls.maxDistance = worldW * 2.5;
+  controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE };
+  controls.touches = { ONE: null, TWO: THREE.TOUCH.DOLLY_PAN };
 
-  // 太陽 (南寄り・朝方の斜光で陰影を立てる)
-  const sun = new THREE.Vector3().setFromSphericalCoords(
-    1, Math.PI / 2 - THREE.MathUtils.degToRad(34), THREE.MathUtils.degToRad(150),
-  );
+  const sun = new THREE.Vector3().setFromSphericalCoords(1, Math.PI / 2 - THREE.MathUtils.degToRad(34), THREE.MathUtils.degToRad(150));
   const sky = new SkyMesh();
   sky.scale.setScalar(worldW * 4);
-  sky.turbidity.value = 3.5;
-  sky.rayleigh.value = 1.1;
-  sky.mieCoefficient.value = 0.004;
-  sky.mieDirectionalG.value = 0.85;
-  sky.sunPosition.value.copy(sun);
-  scene.add(sky);
+  sky.turbidity.value = 3.5; sky.rayleigh.value = 1.1;
+  sky.mieCoefficient.value = 0.004; sky.mieDirectionalG.value = 0.85;
+  sky.sunPosition.value.copy(sun); scene.add(sky);
 
   const dir = new THREE.DirectionalLight(0xfff4e6, 3.0);
   dir.position.copy(sun).multiplyScalar(worldW);
-  dir.castShadow = true;
-  dir.shadow.mapSize.set(4096, 4096);
-  const s = dir.shadow.camera;
-  const r = worldW * 0.75;
-  s.left = -r; s.right = r; s.top = r; s.bottom = -r;
-  s.near = worldW * 0.1; s.far = worldW * 3;
-  dir.shadow.bias = -0.0003;
-  dir.shadow.normalBias = worldW * 0.002;
-  scene.add(dir);
+  dir.castShadow = true; dir.shadow.mapSize.set(4096, 4096);
+  const dsc = dir.shadow.camera; const rr = worldW * 0.7;
+  dsc.left = -rr; dsc.right = rr; dsc.top = rr; dsc.bottom = -rr;
+  dsc.near = worldW * 0.1; dsc.far = worldW * 3;
+  dir.shadow.bias = -0.0003; dir.shadow.normalBias = worldW * 0.002; scene.add(dir);
   scene.add(new THREE.HemisphereLight(0xbcd2ee, 0x4a4238, 0.55));
 
-  // ── 地形メッシュ (実DEM変位 + 実画像ドレープ) ──
-  const MESH = 1024;
-  const geo = new THREE.PlaneGeometry(worldW, worldW, MESH - 1, MESH - 1);
+  const demTexel = 1 / DEM_SIZE;
+  const cell = worldW / DEM_SIZE;
+  const baseAt = (ox: number, oy: number) => texture(baseDemTex, uv().add(vec2(ox * demTexel, oy * demTexel))).r;
+  const simSolidAt = (ox: number, oy: number) => { const s = texture(simTex, uv().add(vec2(ox * demTexel, oy * demTexel))); return s.r.add(s.g); };
+  const simBaseAt = (ox: number, oy: number) => texture(simBaseTex, uv().add(vec2(ox * demTexel, oy * demTexel))).r;
+  const groundAt = (ox: number, oy: number) => baseAt(ox, oy).add(simSolidAt(ox, oy)).sub(simBaseAt(ox, oy)).mul(VERT_EXAG);
+
+  const geo = new THREE.PlaneGeometry(worldW, worldW, MESH_N - 1, MESH_N - 1);
   geo.rotateX(-Math.PI / 2);
-
-  const texel = 1 / size;
-  const cell = worldW / size;
-  const hAt = (ox: number, oy: number) => texture(heightTex, uv().add(vec2(ox * texel, oy * texel))).r.mul(VERT_EXAG);
-
   const mat = new THREE.MeshStandardNodeMaterial({ roughness: 0.95, metalness: 0 });
-  mat.positionNode = positionLocal.add(vec3(0, hAt(0, 0), 0));
-  const nLocal = nrm(vec3(
-    hAt(-1, 0).sub(hAt(1, 0)),
-    cell * 2,
-    hAt(0, 1).sub(hAt(0, -1)),
-  ));
+  mat.positionNode = positionLocal.add(vec3(0, groundAt(0, 0), 0));
+  const nLocal = nrm(vec3(groundAt(-1, 0).sub(groundAt(1, 0)), cell * 2, groundAt(0, 1).sub(groundAt(0, -1))));
   mat.normalNode = transformNormalToView(nLocal);
-  // 実衛星画像に斜面陰影を軽く掛けて立体感を補強
-  const shade = mix(float(0.7), float(1.0), smoothstep(0.35, 0.95, nLocal.y));
-  mat.colorNode = texture(imgTex, uv()).mul(shade);
-
+  const shade = mix(float(0.72), float(1.0), smoothstep(0.3, 0.95, nLocal.y));
+  const wetA = texture(simTex, uv()).a;
+  const photo = texture(imgTex, uv()).mul(shade);
+  mat.colorNode = mix(photo, photo.mul(0.5), smoothstep(0.05, 0.8, wetA));
   const terrain = new THREE.Mesh(geo, mat);
-  terrain.castShadow = true;
-  terrain.receiveShadow = true;
-  scene.add(terrain);
+  terrain.castShadow = true; terrain.receiveShadow = true; scene.add(terrain);
 
-  status.textContent = `${(worldW / 1000).toFixed(0)}km四方 · 標高 ${hMin.toFixed(0)}〜${hMax.toFixed(0)}m · 実衛星画像`;
-  (document.getElementById('hud') as HTMLElement).querySelector('b')!.textContent =
-    'terra-touch geo — 富士山 (実写)';
+  const wgeo = new THREE.PlaneGeometry(worldW, worldW, 511, 511);
+  wgeo.rotateX(-Math.PI / 2);
+  const wmat = new THREE.MeshStandardNodeMaterial({ metalness: 0, roughness: 0.07 });
+  wmat.transparent = true; wmat.depthWrite = false;
+  const depth = texture(simTex, uv()).b;
+  const surfAt = (ox: number, oy: number) => groundAt(ox, oy).add(texture(simTex, uv().add(vec2(ox * demTexel, oy * demTexel))).b.mul(VERT_EXAG));
+  wmat.positionNode = positionLocal.add(vec3(0, surfAt(0, 0), 0));
+  const rip = sin(uv().x.mul(400).add(uTime.mul(1.5))).add(sin(uv().y.mul(360).sub(uTime.mul(1.2)))).mul(0.08);
+  const wN = nrm(vec3(surfAt(-1, 0).sub(surfAt(1, 0)).add(rip), cell * 2, surfAt(0, 1).sub(surfAt(0, -1)).add(rip)));
+  wmat.normalNode = transformNormalToView(wN);
+  wmat.colorNode = mix(vec3(0.10, 0.30, 0.34), vec3(0.02, 0.08, 0.19), smoothstep(0.3, 6.0, depth));
+  wmat.opacityNode = smoothstep(0.06, 0.8, depth).mul(0.9);
+  const waterMesh = new THREE.Mesh(wgeo, wmat);
+  waterMesh.renderOrder = 1; scene.add(waterMesh);
+
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+  let sculpting = false;
+  let mode: 'dig' | 'raise' = 'dig';
+  const pointer = { x: 0, y: 0, has: false };
+  const sampleH = (x: number, z: number) => sim.surfaceHeightUV((x + worldW / 2) / worldW, 0.5 - z / worldW) * VERT_EXAG;
+  function pickWorld(pxp: number, pyp: number): { x: number; z: number } | null {
+    ndc.set((pxp / innerWidth) * 2 - 1, -(pyp / innerHeight) * 2 + 1);
+    raycaster.setFromCamera(ndc, camera);
+    const o = raycaster.ray.origin, d = raycaster.ray.direction;
+    const step = worldW / 700;
+    let t = 0, prev = o.y - sampleH(o.x, o.z);
+    for (let k = 0; k < 900; k++) {
+      t += step; if (t > worldW * 3) break;
+      const x = o.x + d.x * t, z = o.z + d.z * t;
+      const gap = o.y + d.y * t - sampleH(x, z);
+      if (gap <= 0 && prev > 0) {
+        let lo = t - step, hi = t;
+        for (let b = 0; b < 10; b++) { const m = (lo + hi) * 0.5; const g = o.y + d.y * m - sampleH(o.x + d.x * m, o.z + d.z * m); if (g <= 0) hi = m; else lo = m; }
+        const tm = (lo + hi) * 0.5;
+        return { x: o.x + d.x * tm, z: o.z + d.z * tm };
+      }
+      prev = gap;
+    }
+    return null;
+  }
+
+  const canvas = renderer.domElement;
+  canvas.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
+    sculpting = true; pointer.x = e.offsetX; pointer.y = e.offsetY; pointer.has = true;
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', (e) => { pointer.x = e.offsetX; pointer.y = e.offsetY; });
+  const endS = () => { sculpting = false; };
+  canvas.addEventListener('pointerup', endS);
+  canvas.addEventListener('pointercancel', endS);
+
+  function applyBrush(dt: number) {
+    if (!sculpting || !pointer.has) return;
+    const hit = pickWorld(pointer.x, pointer.y);
+    if (!hit) return;
+    sim.brush((hit.x + worldW / 2) / worldW, 0.5 - hit.z / worldW, Math.min(dt, 1 / 30), mode);
+  }
+
+  let raining = false;
+  const btnDig = document.getElementById('mode-dig')!;
+  const btnRaise = document.getElementById('mode-raise')!;
+  const btnRain = document.getElementById('rain')!;
+  const btnReset = document.getElementById('reset')!;
+  const setMode = (m: 'dig' | 'raise') => { mode = m; btnDig.classList.toggle('on', m === 'dig'); btnRaise.classList.toggle('on', m === 'raise'); };
+  btnDig.addEventListener('click', () => setMode('dig'));
+  btnRaise.addEventListener('click', () => setMode('raise'));
+  btnRain.addEventListener('click', () => {
+    raining = !raining; sim.rainRate = raining ? 0.9 : 0;
+    btnRain.textContent = `🌧 雨 ${raining ? 'ON' : 'OFF'}`; btnRain.classList.toggle('on', raining);
+  });
+  btnReset.addEventListener('click', () => {
+    sim.soil.fill(0); sim.water.fill(0); sim.wet.fill(0); sim.bedrock.set(simBed);
+    (sim as unknown as { terrainDirty: boolean }).terrainDirty = true;
+    sim.drained = 0; sim.injected = 0; raining = false; sim.rainRate = 0;
+    btnRain.textContent = '🌧 雨 OFF'; btnRain.classList.remove('on');
+  });
 
   (window as unknown as { __geo: unknown }).__geo = {
-    async render() { await renderer.renderAsync(scene, camera); },
-    info: { worldW, hMin, hMax, size },
+    sim, async render() { await renderer.renderAsync(scene, camera); },
+    async brushAt(x: number, z: number, sec: number, m: 'dig' | 'raise' = 'dig') {
+      const u = (x + worldW / 2) / worldW, v = 0.5 - z / worldW, f = Math.round(sec * 60);
+      for (let k = 0; k < f; k++) { sim.brush(u, v, 1 / 60, m); sim.step(1 / 60, 0); }
+      sim.sync(); await renderer.renderAsync(scene, camera);
+    },
+    async rainFor(sec: number, rate = 0.9) {
+      sim.rainRate = rate; const f = Math.round(sec * 60);
+      for (let k = 0; k < f; k++) sim.step(1 / 60, 1);
+      sim.rainRate = 0; sim.sync(); await renderer.renderAsync(scene, camera);
+    },
+    totals: () => sim.totals(),
+    info: { worldW, hMin, hMax, cell: worldW / SIM_N },
   };
 
+  document.getElementById('hud')!.querySelector('b')!.textContent = 'terra-touch geo — 富士山 (実写・変形可)';
+  const fpsEl = document.getElementById('fps')!;
+  const drift = document.getElementById('drift')!;
+  status.textContent = `${(worldW / 1000).toFixed(0)}km四方 · 標高${hMin.toFixed(0)}〜${hMax.toFixed(0)}m · セル${(worldW / SIM_N).toFixed(0)}m`;
+
+  let frames = 0, last = performance.now(), statLast = last;
   renderer.setAnimationLoop(() => {
+    const now = performance.now();
+    const dt = Math.min((now - last) / 1000, 1 / 20);
+    last = now; uTime.value += dt;
+    applyBrush(dt);
+    sim.step(dt, raining ? 1 : 0);
+    sim.sync();
     controls.update();
     renderer.render(scene, camera);
+    frames++;
+    if (now - statLast >= 500) {
+      fpsEl.textContent = `${Math.round((frames * 1000) / (now - statLast))} fps`;
+      const t = sim.totals();
+      drift.textContent = `土drift ${t.driftPct >= 0 ? '+' : ''}${t.driftPct.toFixed(2)}%${t.nan ? ' ⚠NaN' : ''}`;
+      frames = 0; statLast = now;
+    }
   });
 
   addEventListener('resize', () => {
@@ -208,7 +290,4 @@ async function main() {
   });
 }
 
-main().catch((e) => {
-  status.textContent = `失敗: ${e?.message ?? e}`;
-  console.error(e);
-});
+main().catch((e) => { status.textContent = `失敗: ${e?.message ?? e}`; console.error(e); });
