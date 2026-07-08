@@ -14,6 +14,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { TerrainSim } from './sim';
 import { GpuSim } from './sim-gpu';
+import { VillageSystem, type WorldSensor } from './village';
 import { LOCATIONS, pickLocation, computeZoom } from './locations';
 
 const GRID = 4, TILE = 256;
@@ -380,9 +381,56 @@ async function main() {
     });
   }
 
+  // ── 創世モード (村システム) ──
+  const sampleCpuField = (arr: Float32Array, n: number, u: number, v: number) => {
+    const fx = Math.min(Math.max(u, 0), 1) * (n - 1), fy = Math.min(Math.max(v, 0), 1) * (n - 1);
+    const i0 = Math.floor(fx), j0 = Math.floor(fy), i1 = Math.min(i0 + 1, n - 1), j1 = Math.min(j0 + 1, n - 1);
+    const tx = fx - i0, ty = fy - j0;
+    const gg = (i: number, j: number) => arr[j * n + i];
+    const a = gg(i0, j0) * (1 - tx) + gg(i1, j0) * tx, b = gg(i0, j1) * (1 - tx) + gg(i1, j1) * tx;
+    return a * (1 - ty) + b * ty;
+  };
+  const worldSensor: WorldSensor = {
+    worldW, vertExag: VERT_EXAG,
+    heightUV: (u, v) => demHeightUV(u, v),
+    waterUV: USE_GPU ? (u, v) => gpuSim!.sampleCoarse(u, v, 1) : (u, v) => sampleCpuField(cpuSim!.water, SIM_N, u, v),
+    wetUV: USE_GPU ? (u, v) => gpuSim!.sampleCoarse(u, v, 2) : (u, v) => sampleCpuField(cpuSim!.wet, SIM_N, u, v),
+  };
+  let village: VillageSystem | null = null;
+  let gameMode = false;
+  let coarseTimer = 0;
+  const btnGame = document.getElementById('game')!;
+  const btnSeed = document.getElementById('seed')!;
+  const civEl = document.getElementById('civ')!;
+  const ensureVillage = () => { if (!village) { village = new VillageSystem(worldSensor); scene.add(village.group); } };
+  btnGame.addEventListener('click', () => {
+    gameMode = !gameMode;
+    btnGame.classList.toggle('on', gameMode);
+    btnSeed.style.display = gameMode ? '' : 'none';
+    civEl.style.display = gameMode ? '' : 'none';
+    if (gameMode) { ensureVillage(); if (USE_GPU) gpuSim!.readCoarse(); }
+  });
+  const seedAtScreen = (px: number, py: number) => {
+    ensureVillage();
+    const hit = pickWorld(px, py);
+    if (hit) village!.seed((hit.x + worldW / 2) / worldW, 0.5 - hit.z / worldW);
+  };
+  btnSeed.addEventListener('click', () => seedAtScreen(innerWidth / 2, innerHeight / 2));
+
   const simN = USE_GPU ? DEM_SIZE : SIM_N;
   (window as unknown as { __geo: unknown }).__geo = {
     gpuSim, cpuSim, useGpu: USE_GPU,
+    seed: (u: number, v: number) => { ensureVillage(); gameMode = true; village!.seed(u, v); },
+    village: () => village,
+    // ヘッドレス検証用: 村ロジックを手動で進める (rAF停止中でも動く)
+    async tick(seconds = 6, steps = 360) {
+      ensureVillage(); gameMode = true;
+      if (USE_GPU) await gpuSim!.readCoarse();
+      const dt = seconds / steps;
+      for (let k = 0; k < steps; k++) village!.update(dt);
+      await renderer.renderAsync(scene, camera);
+      return village!.stats();
+    },
     async render() { await renderer.renderAsync(scene, camera); },
     async brushAt(x: number, z: number, sec: number, m: 'dig' | 'raise' = 'dig') {
       const u = (x + worldW / 2) / worldW, v = 0.5 - z / worldW, f = Math.round(sec * 60);
@@ -421,6 +469,12 @@ async function main() {
       if (!sculpting && !raining && settle > 0) settle--;
     }
 
+    // ── 創世モード: 村ロジック更新 ──
+    if (gameMode && village) {
+      village.update(Math.min(dt, 1 / 20));
+      if (USE_GPU) { coarseTimer += dt; if (coarseTimer > 0.5) { coarseTimer = 0; gpuSim!.readCoarse(); } }
+    }
+
     controls.update();
     renderer.render(scene, camera);
     frames++;
@@ -431,6 +485,10 @@ async function main() {
       } else {
         const t = cpuSim!.totals();
         drift.textContent = `土drift ${t.driftPct >= 0 ? '+' : ''}${t.driftPct.toFixed(2)}%${t.nan ? ' ⚠NaN' : ''}`;
+      }
+      if (gameMode && village) {
+        const s = village.stats();
+        civEl.textContent = `🏘${s.villages} 👥${s.pop}${s.bands ? ` (移動中${s.bands})` : ''}`;
       }
       frames = 0; statLast = now;
     }

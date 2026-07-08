@@ -68,6 +68,12 @@ export class GpuSim {
   private kCopy: any;
   // 表示用テクスチャ: [地表高(bed+soil), water, wet, 1]。毎ステップ末に buffer からコピー。
   dispTex!: THREE.StorageTexture;
+  // 村ロジック用の粗い世界センサ (縮約 coarseN²・低頻度読戻し)
+  readonly coarseN = 128;
+  private coarseBuf: any;
+  private coarseAttr!: THREE.StorageInstancedBufferAttribute;
+  private kCoarse: any;
+  coarse: Float32Array; // [height, water, wet, 0] × coarseN²
 
   constructor(renderer: THREE.WebGPURenderer, opts: GpuSimOpts) {
     this.renderer = renderer;
@@ -90,6 +96,9 @@ export class GpuSim {
     this.initStateBuf = instancedArray(initState.slice() as unknown as number, 'vec4'); // reset用の不変コピー
     this.flux = instancedArray(len, 'vec4');
     this.slump = instancedArray(len, 'vec4');
+    this.coarseBuf = instancedArray(this.coarseN * this.coarseN, 'vec4');
+    this.coarseAttr = (this.coarseBuf as unknown as { value: THREE.StorageInstancedBufferAttribute }).value;
+    this.coarse = new Float32Array(this.coarseN * this.coarseN * 4);
 
     // 表示用 StorageTexture (rgba32f・textureLoad で整数座標読み=フィルタ不要でクッキリ)
     this.dispTex = new THREE.StorageTexture(N, N);
@@ -256,6 +265,20 @@ export class GpuSim {
       state.element(instanceIndex).assign(initBuf.element(instanceIndex));
       flux.element(instanceIndex).assign(vec4(0, 0, 0, 0));
     })().compute(N * N);
+
+    // ── 粗い世界センサへ縮約 (coarse cell → 対応する fine cell を代表サンプル) ──
+    const coarseBuf = this.coarseBuf;
+    const CN = int(this.coarseN);
+    const scale = int(Math.floor(N / this.coarseN));
+    this.kCoarse = Fn(() => {
+      const ci = int(instanceIndex.mod(uint(this.coarseN)));
+      const cj = int(instanceIndex.div(uint(this.coarseN)));
+      const fi = ci.mul(scale).add(scale.div(int(2)));
+      const fj = cj.mul(scale).add(scale.div(int(2)));
+      const s = state.element(uint(fj.mul(Ni).add(fi)));
+      coarseBuf.element(instanceIndex).assign(vec4(s.x.add(s.y), s.z, s.w, float(0)));
+    })().compute(this.coarseN * this.coarseN);
+    void CN;
   }
 
   reset() {
@@ -286,6 +309,29 @@ export class GpuSim {
 
   /** dispTex を最新化 (初回描画前など) */
   syncDisp() { this.renderer.compute(this.kCopy); }
+
+  /** 粗い世界センサを GPU→CPU へ読み戻す (低頻度で呼ぶ・~256KB) */
+  async readCoarse(): Promise<Float32Array> {
+    this.renderer.compute(this.kCoarse);
+    const buf = await this.renderer.getArrayBufferAsync(this.coarseAttr as unknown as THREE.BufferAttribute);
+    this.coarse.set(new Float32Array(buf));
+    return this.coarse;
+  }
+
+  /** coarse を u,v(0..1) でバイリニアサンプル。ch: 0=height 1=water 2=wet */
+  sampleCoarse(u: number, v: number, ch: number): number {
+    const N = this.coarseN;
+    const fx = Math.min(Math.max(u, 0), 1) * (N - 1);
+    const fy = Math.min(Math.max(v, 0), 1) * (N - 1);
+    const i0 = Math.floor(fx), j0 = Math.floor(fy);
+    const i1 = Math.min(i0 + 1, N - 1), j1 = Math.min(j0 + 1, N - 1);
+    const tx = fx - i0, ty = fy - j0;
+    const c = this.coarse;
+    const g = (i: number, j: number) => c[(j * N + i) * 4 + ch];
+    const a = g(i0, j0) * (1 - tx) + g(i1, j0) * tx;
+    const b = g(i0, j1) * (1 - tx) + g(i1, j1) * tx;
+    return a * (1 - ty) + b * ty;
+  }
 
   /** CPU へ state を読み戻して総量/NaN を確認 (検証用・重い) */
   async totals(): Promise<{ solid: number; water: number; nan: boolean }> {
