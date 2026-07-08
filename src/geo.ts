@@ -391,7 +391,7 @@ async function main() {
     return a * (1 - ty) + b * ty;
   };
   const worldSensor: WorldSensor = {
-    worldW, vertExag: VERT_EXAG,
+    worldW, vertExag: VERT_EXAG, elevMin: hMin, elevMax: hMax,
     heightUV: (u, v) => demHeightUV(u, v),
     waterUV: USE_GPU ? (u, v) => gpuSim!.sampleCoarse(u, v, 1) : (u, v) => sampleCpuField(cpuSim!.water, SIM_N, u, v),
     wetUV: USE_GPU ? (u, v) => gpuSim!.sampleCoarse(u, v, 2) : (u, v) => sampleCpuField(cpuSim!.wet, SIM_N, u, v),
