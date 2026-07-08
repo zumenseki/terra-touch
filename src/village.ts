@@ -5,6 +5,7 @@
 
 import * as THREE from 'three/webgpu';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { mulberry32 } from './rng';
 
 export interface WorldSensor {
   worldW: number;
@@ -58,14 +59,17 @@ export class VillageSystem {
   private pool: Person[] = [];
   private maxPeople: number;
   private stride: number; // 一歩あたりの脚の位相進み(移動距離基準)
+  private rng: () => number; // 決定論 PRNG (seedRng で再現可)
 
-  constructor(sensor: WorldSensor, opts?: { maxPeople?: number }) {
+  constructor(sensor: WorldSensor, opts?: { maxPeople?: number; seed?: number }) {
     this.sensor = sensor;
     const W = sensor.worldW;
     const U = W * 0.004;
     this.U = U;
     this.stride = U * 0.42;
     this.maxPeople = opts?.maxPeople ?? 40;
+    // 既定 seed は起動毎に変化(従来の Math.random 挙動を維持)。seedRng(n) で再現可能化。
+    this.rng = mulberry32(opts?.seed ?? Math.floor(Math.random() * 0xffffffff));
 
     const wall = new THREE.CylinderGeometry(U * 0.55, U * 0.7, U * 0.7, 7); wall.translate(0, U * 0.35, 0);
     const roof = new THREE.ConeGeometry(U * 0.95, U * 0.85, 7); roof.translate(0, U * 0.7 + U * 0.42, 0);
@@ -122,6 +126,9 @@ export class VillageSystem {
 
   seed(u: number, v: number) { this.bands.push({ u, v, wander: 0 }); }
 
+  // 決定論再シード(検証・A/B比較用)。呼ぶと以降の乱数列が seed で固定される。
+  reseed(seed: number) { this.rng = mulberry32(seed); }
+
   clear() {
     this.villages = []; this.bands = [];
     this.hutMesh.count = 0; this.fireMesh.count = 0;
@@ -155,10 +162,10 @@ export class VillageSystem {
     const p = this.pool.find((x) => !x.active);
     if (!p) return null;
     p.active = true; p.homeRef = ref; p.homeKind = kind;
-    p.u = u; p.v = v; p.tu = u; p.tv = v; p.state = 'pause'; p.timer = Math.random() * 1.5;
-    p.speed = 0.005 + Math.random() * 0.006;
-    p.fx = (Math.random() - 0.5) * this.U * 0.7 / this.sensor.worldW;
-    p.fy = (Math.random() - 0.5) * this.U * 0.7 / this.sensor.worldW;
+    p.u = u; p.v = v; p.tu = u; p.tv = v; p.state = 'pause'; p.timer = this.rng() * 1.5;
+    p.speed = 0.005 + this.rng() * 0.006;
+    p.fx = (this.rng() - 0.5) * this.U * 0.7 / this.sensor.worldW;
+    p.fy = (this.rng() - 0.5) * this.U * 0.7 / this.sensor.worldW;
     p.group.visible = true;
     return p;
   }
@@ -166,8 +173,8 @@ export class VillageSystem {
 
   private wanderTarget(p: Person, vg: Village) {
     const W = this.sensor.worldW;
-    const r = (this.U * (0.8 + Math.random() * 3)) / W;
-    const a = Math.random() * Math.PI * 2;
+    const r = (this.U * (0.8 + this.rng() * 3)) / W;
+    const a = this.rng() * Math.PI * 2;
     p.tu = Math.min(0.98, Math.max(0.02, vg.u + Math.cos(a) * r));
     p.tv = Math.min(0.98, Math.max(0.02, vg.v + Math.sin(a) * r));
   }
@@ -245,7 +252,7 @@ export class VillageSystem {
       } else {
         moved = this.stepToward(p, p.speed * dt);
         const du = p.tu - p.u, dv = p.tv - p.v;
-        if (Math.hypot(du, dv) < p.speed * dt * 1.2) { p.state = 'pause'; p.timer = 0.6 + Math.random() * 3; }
+        if (Math.hypot(du, dv) < p.speed * dt * 1.2) { p.state = 'pause'; p.timer = 0.6 + this.rng() * 3; }
       }
     }
     // 歩行アニメ (移動量に同期=止まると足も止まる)

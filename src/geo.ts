@@ -155,8 +155,12 @@ async function main() {
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.target.set(0, hMax * 0.35 * VERT_EXAG, 0);
   controls.enableDamping = true;
+  controls.dampingFactor = 0.08;       // 慣性を少し強めて手触りを滑らかに
+  controls.zoomToCursor = true;        // ホイール/ピンチはカーソル(2本指中点)へズーム
+  controls.screenSpacePanning = false; // パンは地面(水平)沿い=神ゲーの俯瞰移動に自然
   controls.maxPolarAngle = Math.PI * 0.495;
   controls.minDistance = worldW * 0.02; controls.maxDistance = worldW * 2.5;
+  const CAM_MIN_D = controls.minDistance, CAM_MAX_D = controls.maxDistance;
 
   const sun = new THREE.Vector3().setFromSphericalCoords(1, Math.PI / 2 - THREE.MathUtils.degToRad(34), THREE.MathUtils.degToRad(150));
   const sky = new SkyMesh();
@@ -283,7 +287,13 @@ async function main() {
     const a = hh(i0, j0) * (1 - tx) + hh(i1, j0) * tx, b = hh(i0, j1) * (1 - tx) + hh(i1, j1) * tx;
     return a * (1 - ty) + b * ty;
   };
-  const simHeightUV = (u: number, v: number) => (USE_GPU ? demHeightUV(u, v) : cpuSim!.surfaceHeightUV(u, v));
+  // 変形追従: 彫った/崩れた後の「実際の地表高」を返す。
+  //   GPU: coarse(縮約 ch0=bed+soil)を読戻し済なら使用・未読戻しは静的DEMへフォールバック。
+  //   CPU: sim の変形込み地表高。
+  // これで pickWorld・カメラめり込み・村の適地判定が彫削後の地形に追従する。
+  let coarseReady = false;
+  const simHeightUV = (u: number, v: number) =>
+    (USE_GPU ? (coarseReady ? gpuSim!.sampleCoarse(u, v, 0) : demHeightUV(u, v)) : cpuSim!.surfaceHeightUV(u, v));
 
   const raycaster = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
@@ -323,6 +333,67 @@ async function main() {
   const endS = () => { sculpting = false; };
   canvas.addEventListener('pointerup', endS);
   canvas.addEventListener('pointercancel', endS);
+
+  // ── カメラ補助: ダブルタップ/クリックで注目点へ寄る (フォーカス) ──
+  // camGoal がセットされると loop 内で target を指数補間しつつ距離を60%へ寄せる。
+  let camGoal: { x: number; y: number; z: number; dist: number } | null = null;
+  const focusWorld = (x: number, z: number) => {
+    const curDist = camera.position.distanceTo(controls.target);
+    camGoal = { x, y: sampleH(x, z), z, dist: Math.max(CAM_MIN_D, curDist * 0.6) };
+  };
+  let lastTap = { t: -1e9, x: 0, y: 0 };
+  canvas.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
+    const now = performance.now();
+    if (now - lastTap.t < 300 && Math.hypot(e.offsetX - lastTap.x, e.offsetY - lastTap.y) < 12) {
+      const hit = pickWorld(e.offsetX, e.offsetY);
+      if (hit) focusWorld(hit.x, hit.z);
+      lastTap.t = -1e9; // 消費
+    } else {
+      lastTap = { t: now, x: e.offsetX, y: e.offsetY };
+    }
+  });
+  // ユーザーがカメラ操作を始めたらフォーカス/チルト介入を止める(手動を尊重)
+  let tiltSuspend = 0; // >0 の間は自動チルトを止める(秒)
+  controls.addEventListener('start', () => { camGoal = null; tiltSuspend = 2; });
+
+  // ── キーボード: WASD/矢印でパン, Q/E で回転 (地面平行・速度∝ズーム距離) ──
+  const keys = new Set<string>();
+  addEventListener('keydown', (e) => { keys.add(e.key.toLowerCase()); });
+  addEventListener('keyup', (e) => { keys.delete(e.key.toLowerCase()); });
+  const _panFwd = new THREE.Vector3(), _panRight = new THREE.Vector3(), _panUp = new THREE.Vector3(0, 1, 0);
+  function applyKeys(dt: number) {
+    const k = keys;
+    const panning = k.has('w') || k.has('a') || k.has('s') || k.has('d') ||
+      k.has('arrowup') || k.has('arrowdown') || k.has('arrowleft') || k.has('arrowright');
+    const rot = (k.has('q') ? 1 : 0) - (k.has('e') ? 1 : 0);
+    if (!panning && rot === 0) return;
+    const dist = camera.position.distanceTo(controls.target);
+    if (panning) {
+      // カメラ前方を地面へ射影した水平ベクトルを基準に移動
+      camera.getWorldDirection(_panFwd); _panFwd.y = 0;
+      if (_panFwd.lengthSq() < 1e-8) _panFwd.set(0, 0, -1);
+      _panFwd.normalize();
+      _panRight.crossVectors(_panFwd, _panUp).normalize().multiplyScalar(-1);
+      const spd = dist * 0.8 * dt;
+      const mv = new THREE.Vector3();
+      if (k.has('w') || k.has('arrowup')) mv.add(_panFwd);
+      if (k.has('s') || k.has('arrowdown')) mv.sub(_panFwd);
+      if (k.has('d') || k.has('arrowright')) mv.add(_panRight);
+      if (k.has('a') || k.has('arrowleft')) mv.sub(_panRight);
+      if (mv.lengthSq() > 0) { mv.normalize().multiplyScalar(spd); camera.position.add(mv); controls.target.add(mv); }
+    }
+    if (rot !== 0) {
+      // target 周りに水平回転(azimuth)
+      const off = camera.position.clone().sub(controls.target);
+      const ang = rot * 1.2 * dt;
+      const cs = Math.cos(ang), sn = Math.sin(ang);
+      const nx = off.x * cs - off.z * sn, nz = off.x * sn + off.z * cs;
+      off.x = nx; off.z = nz;
+      camera.position.copy(controls.target).add(off);
+    }
+    camGoal = null; tiltSuspend = 2;
+  }
 
   // ── シム稼働の間引き (静止時は止めて軽量) ──
   let settle = 0;         // >0 の間はシムを回す
@@ -392,7 +463,8 @@ async function main() {
   };
   const worldSensor: WorldSensor = {
     worldW, vertExag: VERT_EXAG, elevMin: hMin, elevMax: hMax,
-    heightUV: (u, v) => demHeightUV(u, v),
+    heightUV: (u, v) => simHeightUV(u, v), // 変形追従(彫った地形に村が追従)
+
     waterUV: USE_GPU ? (u, v) => gpuSim!.sampleCoarse(u, v, 1) : (u, v) => sampleCpuField(cpuSim!.water, SIM_N, u, v),
     wetUV: USE_GPU ? (u, v) => gpuSim!.sampleCoarse(u, v, 2) : (u, v) => sampleCpuField(cpuSim!.wet, SIM_N, u, v),
   };
@@ -408,7 +480,7 @@ async function main() {
     btnGame.classList.toggle('on', gameMode);
     btnSeed.style.display = gameMode ? '' : 'none';
     civEl.style.display = gameMode ? '' : 'none';
-    if (gameMode) { ensureVillage(); if (USE_GPU) gpuSim!.readCoarse(); }
+    if (gameMode) { ensureVillage(); if (USE_GPU) gpuSim!.readCoarse().then(() => { coarseReady = true; }); }
   });
   const seedAtScreen = (px: number, py: number) => {
     ensureVillage();
@@ -425,7 +497,7 @@ async function main() {
     // ヘッドレス検証用: 村ロジックを手動で進める (rAF停止中でも動く)
     async tick(seconds = 6, steps = 360) {
       ensureVillage(); gameMode = true;
-      if (USE_GPU) await gpuSim!.readCoarse();
+      if (USE_GPU) { await gpuSim!.readCoarse(); coarseReady = true; }
       const dt = seconds / steps;
       for (let k = 0; k < steps; k++) village!.update(dt);
       await renderer.renderAsync(scene, camera);
@@ -443,13 +515,62 @@ async function main() {
       simRain(0); await renderer.renderAsync(scene, camera);
     },
     async totals() { return USE_GPU ? await gpuSim!.totals() : cpuSim!.totals(); },
-    info: { worldW, hMin, hMax, cell: worldW / simN, isTouch: IS_TOUCH, simN, useGpu: USE_GPU },
+    // 決定論再シード(A/B比較・回帰用)。以降の村乱数列が固定される。
+    seedRng(n: number) { ensureVillage(); village!.reseed(n); },
+    // カメラ検証用
+    camera: {
+      focusOn(u: number, v: number) { focusWorld(u * worldW - worldW / 2, worldW / 2 - v * worldW); },
+      step(dt = 1 / 60, n = 1) { for (let k = 0; k < n; k++) stepCamera(dt); },
+      setPos(x: number, y: number, z: number) { camera.position.set(x, y, z); },
+      pressKey(key: string) { keys.add(key.toLowerCase()); },
+      releaseKeys() { keys.clear(); },
+      targetPos() { return { x: controls.target.x, y: controls.target.y, z: controls.target.z }; },
+      camPos() { return { x: camera.position.x, y: camera.position.y, z: camera.position.z }; },
+      dist() { return camera.position.distanceTo(controls.target); },
+      groundAt(x: number, z: number) { return sampleH(x, z); },
+    },
+    info: {
+      worldW, hMin, hMax, cell: worldW / simN, isTouch: IS_TOUCH, simN, useGpu: USE_GPU,
+      get calls() { return renderer.info.render.calls; },
+    },
   };
 
   document.getElementById('hud')!.querySelector('b')!.textContent = `terra-touch — ${LOC.name_ja}`;
   const fpsEl = document.getElementById('fps')!;
   const drift = document.getElementById('drift')!;
   status.textContent = `${(worldW / 1000).toFixed(0)}km四方 · 標高${hMin.toFixed(0)}〜${hMax.toFixed(0)}m · ${IS_TOUCH ? 'スマホ' : 'PC'}`;
+
+  // カメラ更新1フレーム分: キーボード → フォーカス補間 → ズーム連動チルト → controls.update → めり込みクランプ。
+  // loop と __geo.stepCamera(ヘッドレス検証) の両方から呼ぶ。
+  function stepCamera(dt: number) {
+    applyKeys(dt);
+    if (camGoal) {
+      const a = 1 - Math.exp(-6 * dt);
+      controls.target.x += (camGoal.x - controls.target.x) * a;
+      controls.target.y += (camGoal.y - controls.target.y) * a;
+      controls.target.z += (camGoal.z - controls.target.z) * a;
+      const off = camera.position.clone().sub(controls.target);
+      const d = off.length();
+      off.setLength(d + (camGoal.dist - d) * a);
+      camera.position.copy(controls.target).add(off);
+      if (Math.hypot(camGoal.x - controls.target.x, camGoal.y - controls.target.y, camGoal.z - controls.target.z) < worldW * 0.001) camGoal = null;
+    }
+    if (tiltSuspend > 0) { tiltSuspend -= dt; }
+    else {
+      const off = camera.position.clone().sub(controls.target);
+      const r = off.length();
+      const f = Math.min(1, Math.max(0, (r - CAM_MIN_D) / (CAM_MAX_D * 0.5)));
+      const goalPolar = THREE.MathUtils.degToRad(45 + 25 * f);
+      const curPolar = Math.acos(Math.min(1, Math.max(-1, off.y / r)));
+      const np = curPolar + (goalPolar - curPolar) * (1 - Math.exp(-1.5 * dt));
+      const azim = Math.atan2(off.x, off.z), sinP = Math.sin(np);
+      off.set(r * sinP * Math.sin(azim), r * Math.cos(np), r * sinP * Math.cos(azim));
+      camera.position.copy(controls.target).add(off);
+    }
+    controls.update();
+    const g = sampleH(camera.position.x, camera.position.z) + worldW * 0.006;
+    if (camera.position.y < g) camera.position.y += (g - camera.position.y) * 0.3;
+  }
 
   let frames = 0, last = performance.now(), statLast = last;
   renderer.setAnimationLoop(() => {
@@ -466,16 +587,20 @@ async function main() {
         cpuSim!.step(dt, (raining || everRained) ? 1 : 0);
         cpuSim!.sync();
       }
-      if (!sculpting && !raining && settle > 0) settle--;
+      if (!sculpting && !raining && settle > 0) {
+        settle--;
+        // 沈静化した瞬間に coarse を1発読み戻す=彫った地形に pick/カメラ/村が追従
+        if (settle === 0 && USE_GPU) gpuSim!.readCoarse().then(() => { coarseReady = true; });
+      }
     }
 
     // ── 創世モード: 村ロジック更新 ──
     if (gameMode && village) {
       village.update(Math.min(dt, 1 / 20));
-      if (USE_GPU) { coarseTimer += dt; if (coarseTimer > 0.5) { coarseTimer = 0; gpuSim!.readCoarse(); } }
+      if (USE_GPU) { coarseTimer += dt; if (coarseTimer > 0.5) { coarseTimer = 0; gpuSim!.readCoarse().then(() => { coarseReady = true; }); } }
     }
 
-    controls.update();
+    stepCamera(dt);
     renderer.render(scene, camera);
     frames++;
     if (now - statLast >= 500) {
