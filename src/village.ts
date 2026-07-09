@@ -6,6 +6,7 @@
 import * as THREE from 'three/webgpu';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { mulberry32 } from './rng';
+import { EcologySystem } from './ecology';
 
 export interface WorldSensor {
   worldW: number;
@@ -149,6 +150,8 @@ export class VillageSystem {
   private stride: number;
   private rngSim: () => number;   // 生命/経済/出産/死 (cap非依存)
   private rngView: () => number;  // 表示サンプル(徘徊/体割当)
+  eco: EcologySystem;             // N6 生態(魚+陸獣)
+  private ecoRefreshAcc = 0;
 
   // クロック & カウンタ
   private simAcc = 0;
@@ -190,6 +193,9 @@ export class VillageSystem {
     this.fireMesh.count = 0; this.fireMesh.frustumCulled = false; this.group.add(this.fireMesh);
 
     this.buildPeople();
+
+    this.eco = new EcologySystem(sensor, { fishCap: this.maxPeople * 2, animalCap: this.maxPeople });
+    this.group.add(this.eco.group);
   }
 
   private buildPeople() {
@@ -282,6 +288,7 @@ export class VillageSystem {
 
   clear() {
     this.villages = []; this.bands = []; this.dyingList = [];
+    this.eco.clear(); this.ecoRefreshAcc = 0;
     this.hutMesh.count = 0; this.fireMesh.count = 0; this.hutSig = '';
     for (const p of this.pool) { p.active = false; p.dying = false; p.fade = 1; p.homeRef = null; p.homeKind = null; p.agent = null; }
     for (const m of this.allParts) { for (let i = 0; i < this.maxPeople; i++) m.setMatrixAt(i, this.mZero); m.instanceMatrix.needsUpdate = true; }
@@ -308,7 +315,8 @@ export class VillageSystem {
     const waterScore = Math.min(1, this.sensor.wetUV(u, v) * 2 + this.sensor.waterUV(u, v) * 0.4);
     const range = Math.max(1, this.sensor.elevMax - this.sensor.elevMin);
     const en = Math.min(1, Math.max(0, (this.sensor.heightUV(u, v) - this.sensor.elevMin) / range));
-    return flat * (0.55 + 0.45 * waterScore) * (0.45 + 0.55 * (1 - en * 0.7));
+    // 誘引: 魚/獣が多い水辺は最大1.2倍(人が狩り/漁に来る)
+    return flat * (0.55 + 0.45 * waterScore) * (0.45 + 0.55 * (1 - en * 0.7)) * this.eco.attractFactor(u, v);
   }
 
   // ── メイン更新: 毎フレーム(band移動/歩行/描画) + 低頻度tick(生命シム) ──
@@ -362,6 +370,9 @@ export class VillageSystem {
 
   // ── 生命シム 1 tick (dtY gameYear) ──
   private simTick() {
+    // 生態: 容量は低頻度更新(水/地形は緩変化)、密度は毎tick。
+    if (++this.ecoRefreshAcc >= 20) { this.ecoRefreshAcc = 0; this.eco.refreshCapacity(); }
+    this.eco.tick(DT_Y);
     for (const vg of this.villages) {
       vg.agents = this.ageAndDie(vg.agents);
       if (this.testHuts >= 0) vg.huts = this.testHuts;
@@ -380,6 +391,7 @@ export class VillageSystem {
     }
     for (let i = this.bands.length - 1; i >= 0; i--) if (this.bands[i].agents.length === 0) this.bands.splice(i, 1);
     this.reconcileBodies();
+    this.eco.render();
   }
 
   // 加齢 + 死(自然=age≥span / 運死=誕生日にhazardロール)。生存者を返す。
@@ -409,10 +421,21 @@ export class VillageSystem {
     // 建築者を予約(食料が薄いと0=全員食料へ)。残りが採集。
     const foodGate = this.testInfFood ? 1 : clamp((vg.foodStock / Math.max(1e-6, upkeep) - 0.1) / 0.3, 0, 1);
     const builders = Math.min(2, Math.floor(labor * 0.35 * foodGate));
-    const Wg = Math.max(0, labor - builders);
+    let avail = Math.max(0, labor - builders);
+    // 漁/狩を割当(ポテンシャルがあれば)。残りが採集。
+    const fishPot = this.eco.fishPot(vg.u, vg.v), huntPot = this.eco.huntPot(vg.u, vg.v);
+    const fishers = fishPot > 0.2 ? Math.min(avail, 8, Math.max(1, Math.round(avail * 0.5))) : 0;
+    avail -= fishers;
+    const hunters = huntPot > 0.2 ? Math.min(avail, 6, Math.max(1, Math.round(avail * 0.4))) : 0;
+    avail -= hunters;
+    const Wg = avail;
     const effW = Math.min(Wg, 12) + 0.25 * Math.max(0, Wg - 12); // 収穫逓減
     const s = this.suitability(vg.u, vg.v);
-    const intakeRate = GATHER_BASE * effW * s; // fu/年
+    // 収穫(魚/獣を除去し食料へ)。intakeRate は 年率に換算。
+    const takeFish = this.eco.harvestFish(vg.u, vg.v, fishers, DT_Y);
+    const takeAnimal = this.eco.harvestLand(vg.u, vg.v, hunters, DT_Y);
+    const harvestRate = (takeFish + takeAnimal) / DT_Y; // fu/年
+    const intakeRate = GATHER_BASE * effW * s + harvestRate; // fu/年
     if (this.testInfFood) {
       vg.foodStock = storageCap; vg.hungerY = 0; vg.deathAcc = 0; vg.surplusY += DT_Y;
       return { intakeRate: Math.max(intakeRate, upkeep * 1.2), upkeep, builders };
@@ -731,6 +754,7 @@ export class VillageSystem {
       kids, adults, elders,
       food: Math.round(food * 100) / 100,
       huts, trees: Math.round(trees),
+      fish: Math.round(this.eco.totals().fish), animals: Math.round(this.eco.totals().land),
     };
   }
 
