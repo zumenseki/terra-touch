@@ -44,6 +44,14 @@ const HUNGER_RATE = 3;             // hungerY += dtY*3*(1-nutrition)
 const CONS_KID = 0.5, CONS_ADULT = 1.0, CONS_ELDER = 0.7; // 消費 fu/年
 const LABOR_ELDER = 0.5;           // 老人の労働係数
 
+// ── N4 建築 (SPEC-life-sim §5) ──
+const LOGS_PER_HUT = 8;            // 1軒に必要な丸太
+const LOGS_PER_TREE = 2;           // 木1本=2丸太
+const LUMBER_RATE = 24;            // 伐採+運搬 logs / worker年
+const BUILD_WORK = 0.5;            // 建築 worker年 / 軒
+const TREE_REGROW = 4;             // 木の再生 本/年
+const TREES_CAP_BASE = 24;         // 木の上限 = 24 * vegScore
+
 function hazardAt(ay: number): number {
   if (ay <= 0) return 0.12;
   if (ay <= 4) return 0.03;
@@ -65,11 +73,13 @@ interface LifeAgent {
   body: number;  // pool 添字 (-1=非表示)
 }
 
+interface BuildSite { logs: number; workY: number; stage: number; }
 interface Village {
-  u: number; v: number; huts: number; age: number;
+  u: number; v: number; huts: number; age: number; // huts = 建築済み軒数(N4=hutsBuilt)
   agents: LifeAgent[]; birthAcc: number;
   kids: number; adultsF: number; adultsM: number; elders: number;
   foodStock: number; hungerY: number; surplusY: number; deathAcc: number;
+  trees: number; site: BuildSite | null; // N4 建築
 }
 interface Band { u: number; v: number; wander: number; tu?: number; tv?: number; agents: LifeAgent[]; }
 
@@ -148,6 +158,10 @@ export class VillageSystem {
   private totalFounders = 0;
   private totalBirths = 0;
   private totalDeaths = 0;
+  // N4 建築の保存則検証用
+  private totalChopped = 0;      // 累計伐採丸太
+  private totalTreesConsumed = 0;
+  private hutsCompleted = 0;     // 建築で完成した軒数(初期credit除く)
   private recordDeaths = false;
   private deathLog: number[] = [];
   // 検証用フラグ(通常は無効)
@@ -272,6 +286,7 @@ export class VillageSystem {
     for (const p of this.pool) { p.active = false; p.dying = false; p.fade = 1; p.homeRef = null; p.homeKind = null; p.agent = null; }
     for (const m of this.allParts) { for (let i = 0; i < this.maxPeople; i++) m.setMatrixAt(i, this.mZero); m.instanceMatrix.needsUpdate = true; }
     this.totalFounders = 0; this.totalBirths = 0; this.totalDeaths = 0;
+    this.totalChopped = 0; this.totalTreesConsumed = 0; this.hutsCompleted = 0;
     this.nextId = 1; this.nextLine = 1; this.simAcc = 0; this.ticksDone = 0;
     this.recordDeaths = false; this.deathLog = [];
   }
@@ -349,9 +364,10 @@ export class VillageSystem {
   private simTick() {
     for (const vg of this.villages) {
       vg.agents = this.ageAndDie(vg.agents);
-      vg.huts = this.testHuts >= 0 ? this.testHuts : autoHuts(vg.agents.length);
+      if (this.testHuts >= 0) vg.huts = this.testHuts;
       this.recomputeDemo(vg);
-      const econ = this.economy(vg);       // 採集/消費/貯蔵/飢餓死
+      const econ = this.economy(vg);       // 採集/消費/貯蔵/飢餓死 + builders予約
+      this.buildStep(vg, econ.builders);   // 伐採→運搬→建築(huts++)
       this.recomputeDemo(vg);              // 飢餓死後の demo
       this.birthsIn(vg, econ.intakeRate, econ.upkeep); // 完全B式
       this.recomputeDemo(vg);              // 出産後の最終 demo
@@ -384,20 +400,22 @@ export class VillageSystem {
     return survivors;
   }
 
-  // 食料経済(N2: 採集のみ・魚/狩/建築は N4/N6)。飢餓死まで処理し {intakeRate, upkeep} を返す。
-  private economy(vg: Village): { intakeRate: number; upkeep: number } {
+  // 食料経済。builders を労働から予約し残りが採集。飢餓死まで処理。
+  private economy(vg: Village): { intakeRate: number; upkeep: number; builders: number } {
     const kids = vg.kids, adults = vg.adultsF + vg.adultsM, elders = vg.elders;
     const labor = adults + LABOR_ELDER * elders;
     const upkeep = kids * CONS_KID + adults * CONS_ADULT + elders * CONS_ELDER; // fu/年
     const storageCap = vg.huts * STORE_PER_HUT;
-    // N2 は全労働が採集(builders/fishers/hunters は N4/N6 で導入)
-    const Wg = labor;
+    // 建築者を予約(食料が薄いと0=全員食料へ)。残りが採集。
+    const foodGate = this.testInfFood ? 1 : clamp((vg.foodStock / Math.max(1e-6, upkeep) - 0.1) / 0.3, 0, 1);
+    const builders = Math.min(2, Math.floor(labor * 0.35 * foodGate));
+    const Wg = Math.max(0, labor - builders);
     const effW = Math.min(Wg, 12) + 0.25 * Math.max(0, Wg - 12); // 収穫逓減
     const s = this.suitability(vg.u, vg.v);
     const intakeRate = GATHER_BASE * effW * s; // fu/年
     if (this.testInfFood) {
       vg.foodStock = storageCap; vg.hungerY = 0; vg.deathAcc = 0; vg.surplusY += DT_Y;
-      return { intakeRate: Math.max(intakeRate, upkeep * 1.2), upkeep };
+      return { intakeRate: Math.max(intakeRate, upkeep * 1.2), upkeep, builders };
     }
     const intake = intakeRate * DT_Y;
     const need = upkeep * DT_Y;
@@ -412,7 +430,34 @@ export class VillageSystem {
     vg.deathAcc += vg.agents.length * M_STARVE * (1 - nutrition) * DT_Y;
     let guard = 0;
     while (vg.deathAcc >= 1 && vg.agents.length > 0 && guard++ < MAX_AGENTS) { vg.deathAcc -= 1; this.starve(vg); }
-    return { intakeRate, upkeep };
+    return { intakeRate, upkeep, builders };
+  }
+
+  // 伐採→運搬→建築(1村1サイト)。木を消費し、丸太8+建築0.5worker年で1軒完成。
+  private buildStep(vg: Village, builders: number) {
+    const cap = TREES_CAP_BASE * this.vegScore(vg.u, vg.v);
+    vg.trees = Math.min(cap, vg.trees + TREE_REGROW * DT_Y); // 木の再生
+    if (this.testHuts >= 0 || builders <= 0) return;         // huts固定テスト時は建てない
+    // 着工: 空き & 上限未満 & 人口が家容量に近い & 木がある
+    if (!vg.site && vg.huts < 12 && vg.agents.length > vg.huts * 6 - 2 && vg.trees >= 4) {
+      vg.site = { logs: 0, workY: 0, stage: 0 };
+    }
+    const site = vg.site;
+    if (!site) return;
+    if (site.logs < LOGS_PER_HUT) {
+      // 伐採+運搬(木を消費・2丸太/本)
+      const add = Math.min(LOGS_PER_HUT - site.logs, builders * LUMBER_RATE * DT_Y, vg.trees * LOGS_PER_TREE);
+      if (add > 0) {
+        site.logs += add; const treesUsed = add / LOGS_PER_TREE; vg.trees -= treesUsed;
+        this.totalChopped += add; this.totalTreesConsumed += treesUsed;
+      }
+    } else {
+      site.workY = Math.min(BUILD_WORK, site.workY + builders * DT_Y); // 建築
+    }
+    site.stage = site.logs < LOGS_PER_HUT ? 0 : (site.workY < 0.25 ? 1 : 2);
+    if (site.logs >= LOGS_PER_HUT && site.workY >= BUILD_WORK) { // 完成
+      vg.huts = Math.min(12, vg.huts + 1); this.hutsCompleted++; vg.site = null;
+    }
   }
 
   private starve(vg: Village) {
@@ -464,11 +509,20 @@ export class VillageSystem {
     }
   }
 
+  // 植生スコア(M3植生未実装のfallback): 平地×低地×湿り。木の上限に使う。川を掘ると森が濃い。
+  private vegScore(u: number, v: number): number {
+    const flat = this.flat(u, v);
+    const range = Math.max(1, this.sensor.elevMax - this.sensor.elevMin);
+    const en = Math.min(1, Math.max(0, (this.sensor.heightUV(u, v) - this.sensor.elevMin) / range));
+    const wet = this.sensor.wetUV(u, v);
+    return flat * (1 - en) * (0.3 + 0.7 * Math.min(1, wet * 2));
+  }
   private makeVillage(u: number, v: number, agents: LifeAgent[]): Village {
-    const huts = autoHuts(agents.length);
+    const huts = autoHuts(agents.length); // 新村の家credit(鶏卵回避)
     const vg: Village = {
       u, v, huts, age: 0, agents, birthAcc: 0, kids: 0, adultsF: 0, adultsM: 0, elders: 0,
       foodStock: huts * STORE_PER_HUT, hungerY: 0, surplusY: 0, deathAcc: 0,
+      trees: TREES_CAP_BASE * this.vegScore(u, v), site: null,
     };
     this.recomputeDemo(vg);
     return vg;
@@ -630,9 +684,9 @@ export class VillageSystem {
 
   private renderStatic() {
     const W = this.sensor.worldW, U = this.U, d = this.dummy;
-    // 家: 村構成が変わった時だけ再構築(ダーティフラグ)。
+    // 家: 村構成/建築ステージが変わった時だけ再構築(ダーティフラグ)。
     let sig = this.villages.length + '|';
-    for (const vg of this.villages) sig += vg.huts + ',' + Math.round(vg.u * 1e4) + ',' + Math.round(vg.v * 1e4) + ';';
+    for (const vg of this.villages) sig += vg.huts + '/' + (vg.site ? vg.site.stage + 1 : 0) + ',' + Math.round(vg.u * 1e4) + ',' + Math.round(vg.v * 1e4) + ';';
     if (sig !== this.hutSig) {
       this.hutSig = sig;
       let hi = 0;
@@ -643,6 +697,14 @@ export class VillageSystem {
           const u = vg.u + (Math.cos(ang) * rad) / W, v = vg.v + (Math.sin(ang) * rad) / W;
           this.pos(u, v, d.position); d.rotation.set(0, ang * 2.1, 0);
           d.scale.setScalar(0.8 + 0.25 * ((k * 7) % 5) / 5); d.updateMatrix();
+          this.hutMesh.setMatrixAt(hi++, d.matrix);
+        }
+        // 建築中サイト = 次のスパイラル位置に段階スケールの小屋(0.35→0.6→0.85)
+        if (vg.site && hi < MAX_HUTS) {
+          const k = vg.huts, ang = k * 2.399963, rad = U * 1.3 * Math.sqrt(k);
+          const u = vg.u + (Math.cos(ang) * rad) / W, v = vg.v + (Math.sin(ang) * rad) / W;
+          this.pos(u, v, d.position); d.rotation.set(0, ang * 2.1, 0);
+          d.scale.setScalar([0.35, 0.6, 0.85][vg.site.stage] ?? 0.35); d.updateMatrix();
           this.hutMesh.setMatrixAt(hi++, d.matrix);
         }
       }
@@ -659,8 +721,8 @@ export class VillageSystem {
   }
 
   stats() {
-    let pop = 0, kids = 0, adults = 0, elders = 0, food = 0;
-    for (const v of this.villages) { pop += v.agents.length; kids += v.kids; adults += v.adultsF + v.adultsM; elders += v.elders; food += v.foodStock; }
+    let pop = 0, kids = 0, adults = 0, elders = 0, food = 0, huts = 0, trees = 0;
+    for (const v of this.villages) { pop += v.agents.length; kids += v.kids; adults += v.adultsF + v.adultsM; elders += v.elders; food += v.foodStock; huts += v.huts; trees += v.trees; }
     for (const b of this.bands) pop += b.agents.length;
     return {
       villages: this.villages.length, pop, bands: this.bands.length,
@@ -668,6 +730,7 @@ export class VillageSystem {
       births: this.totalBirths, deaths: this.totalDeaths,
       kids, adults, elders,
       food: Math.round(food * 100) / 100,
+      huts, trees: Math.round(trees),
     };
   }
 
@@ -697,5 +760,10 @@ export class VillageSystem {
   _lines(i: number): number { const v = this.villages[i]; if (!v) return 0; const s = new Set<number>(); for (const a of v.agents) s.add(a.line); return s.size; }
   _suit(u: number, v: number): number { return this.suitability(u, v); }
   _villageDemo(i: number) { const v = this.villages[i]; if (!v) return null; return { pop: v.agents.length, kids: v.kids, af: v.adultsF, am: v.adultsM, elders: v.elders, food: Math.round(v.foodStock * 100) / 100, hunger: Math.round(v.hungerY * 100) / 100, huts: v.huts }; }
+  _villageBuild(i: number) { const v = this.villages[i]; if (!v) return null; return { huts: v.huts, trees: Math.round(v.trees * 100) / 100, site: v.site ? { logs: Math.round(v.site.logs * 100) / 100, workY: Math.round(v.site.workY * 1000) / 1000, stage: v.site.stage } : null }; }
+  _woodStats() {
+    let siteLogs = 0; for (const v of this.villages) if (v.site) siteLogs += v.site.logs;
+    return { chopped: Math.round(this.totalChopped * 1000) / 1000, treesConsumed: Math.round(this.totalTreesConsumed * 1000) / 1000, hutsCompleted: this.hutsCompleted, siteLogs: Math.round(siteLogs * 1000) / 1000 };
+  }
   _bestSuit(): number { let best = 0; const N = 40; for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) { const s = this.suitability((i + 0.5) / N, (j + 0.5) / N); if (s > best) best = s; } return best; }
 }

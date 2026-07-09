@@ -615,7 +615,7 @@ async function main() {
       }
       if (gameMode && village) {
         const s = village.stats();
-        civEl.textContent = `⏳${Math.floor(s.year)}y 🏘${s.villages} 👥${s.pop}${s.bands ? ` (移動中${s.bands})` : ''} 👶${s.kids} 🧑${s.adults} 👴${s.elders} 🌾${s.food}`;
+        civEl.textContent = `⏳${Math.floor(s.year)}y 🏘${s.villages} 👥${s.pop}${s.bands ? ` (移動中${s.bands})` : ''} 👶${s.kids} 🧑${s.adults} 👴${s.elders} 🌾${s.food} 🏚${s.huts} 🌲${s.trees}`;
       }
       frames = 0; statLast = now;
     }
