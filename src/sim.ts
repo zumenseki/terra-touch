@@ -79,6 +79,8 @@ export class TerrainSim {
   private sourceI: number;
   private sourceJ: number;
   private norm: BrushNorm;
+  // 神の川ツール: 恒常水源(spring)。grid 座標 + q(m³/s)。
+  springs: { i: number; j: number; q: number }[] = [];
 
   constructor(opts: SimOpts = {}) {
     const geo = !!opts.bedrock;
@@ -181,6 +183,12 @@ export class TerrainSim {
     this.sourceI = Math.round(Math.min(Math.max(u, 0), 1) * (this.n - 1));
     this.sourceJ = Math.round(Math.min(Math.max(v, 0), 1) * (this.n - 1));
   }
+
+  /** 神の川ツール: 恒常水源を追加/全消去 */
+  addSpringUV(u: number, v: number, q = 0.4) {
+    this.springs.push({ i: Math.round(Math.min(Math.max(u, 0), 1) * (this.n - 1)), j: Math.round(Math.min(Math.max(v, 0), 1) * (this.n - 1)), q });
+  }
+  clearSprings() { this.springs.length = 0; }
 
   surfaceHeightUV(u: number, v: number): number {
     const N = this.n;
@@ -336,6 +344,23 @@ export class TerrainSim {
       }
       if (wsum > 0) for (let k = 0; k < cells.length; k++) W[cells[k]] += (add * (wgt[k] / wsum)) / AREA;
       this.injected += add;
+    }
+
+    // 神の川ツール: 恒常水源(複数)。水深レート方式(円錐0..1・セルサイズ非依存・GPU kSourceと同型)。
+    if (this.springs.length > 0) {
+      const rad = Math.max(1, Math.round((cell * N) / 256 / cell)); // ~world/256 in cells
+      for (const sp of this.springs) {
+        const rate = sp.q; // m/s 水深(中心)
+        for (let dj = -rad; dj <= rad; dj++) for (let di = -rad; di <= rad; di++) {
+          const i = sp.i + di, j = sp.j + dj;
+          if (i < 0 || j < 0 || i >= N || j >= N) continue;
+          const dn = Math.hypot(di, dj) / (rad + 0.5);
+          const wgt = Math.max(0, 1 - dn * dn);
+          if (wgt <= 0) continue;
+          const dW = rate * dt * wgt;
+          W[j * N + i] += dW; this.injected += dW * AREA;
+        }
+      }
     }
 
     for (let c = 0; c < surf.length; c++) surf[c] = B[c] + S[c] + W[c];

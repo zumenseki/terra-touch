@@ -399,12 +399,33 @@ async function main() {
   let settle = 0;         // >0 の間はシムを回す
   let everRained = false; // 一度でも雨→水を回し続ける
 
+  // ── 神の川ツール: 恒常水源(spring)。なぞった経路に水源を落とす。 ──
+  const MAX_SPRINGS = IS_TOUCH ? 4 : 8;
+  const SPRING_Q = 0.4; // 水深レート m/s (雨0.1の局所強化版・セルサイズ非依存)
+  let riverMode = false;
+  let lastSpringU = -1, lastSpringV = -1;
+  const springCount = () => (USE_GPU ? gpuSim!.springs.length : cpuSim!.springs.length);
+  const simAddSpring = (u: number, v: number) => {
+    if (USE_GPU) { if (gpuSim!.springs.length >= MAX_SPRINGS) gpuSim!.springs.shift(); gpuSim!.springs.push({ u, v, q: SPRING_Q }); }
+    else { if (cpuSim!.springs.length >= MAX_SPRINGS) cpuSim!.springs.shift(); cpuSim!.addSpringUV(u, v, SPRING_Q); }
+    everRained = true; settle = Math.max(settle, 120);
+  };
+  const simClearSprings = () => { if (USE_GPU) gpuSim!.springs.length = 0; else cpuSim!.clearSprings(); };
+
   function applyBrush(dt: number) {
     if (!sculpting || !pointer.has) return;
     const hit = pickWorld(pointer.x, pointer.y);
     if (!hit) return;
-    simBrush((hit.x + worldW / 2) / worldW, 0.5 - hit.z / worldW, Math.min(dt, 1 / 30), mode);
-    settle = 60;
+    const u = (hit.x + worldW / 2) / worldW, v = 0.5 - hit.z / worldW;
+    if (riverMode) {
+      // なぞった経路に一定間隔で水源を落とす(既存 sim が下流へ流す=谷に川)
+      const d = Math.hypot(u - lastSpringU, v - lastSpringV);
+      if (lastSpringU < 0 || d > 0.03) { simAddSpring(u, v); lastSpringU = u; lastSpringV = v; }
+      settle = 120;
+    } else {
+      simBrush(u, v, Math.min(dt, 1 / 30), mode);
+      settle = 60;
+    }
   }
 
   let raining = false;
@@ -413,11 +434,18 @@ async function main() {
   const btnRaise = document.getElementById('mode-raise')!;
   const btnRain = document.getElementById('rain')!;
   const btnReset = document.getElementById('reset')!;
-  const setMode = (m: 'dig' | 'raise') => { mode = m; btnDig.classList.toggle('on', m === 'dig'); btnRaise.classList.toggle('on', m === 'raise'); };
+  const btnRiver = document.getElementById('river');
+  const refreshRiverBtn = () => { if (btnRiver) btnRiver.classList.toggle('on', riverMode); };
+  const setMode = (m: 'dig' | 'raise') => { mode = m; riverMode = false; refreshRiverBtn(); btnDig.classList.toggle('on', m === 'dig'); btnRaise.classList.toggle('on', m === 'raise'); };
   const refreshLookBtn = () => { btnLook.textContent = sculptOn ? '✏️ 彫るモード' : '🖐 見るモード'; btnLook.classList.toggle('on', sculptOn); };
-  btnLook.addEventListener('click', () => { sculptOn = !sculptOn; applyControlMode(); refreshLookBtn(); });
+  btnLook.addEventListener('click', () => { sculptOn = !sculptOn; riverMode = false; refreshRiverBtn(); applyControlMode(); refreshLookBtn(); });
   btnDig.addEventListener('click', () => { if (!sculptOn) { sculptOn = true; applyControlMode(); refreshLookBtn(); } setMode('dig'); });
   btnRaise.addEventListener('click', () => { if (!sculptOn) { sculptOn = true; applyControlMode(); refreshLookBtn(); } setMode('raise'); });
+  if (btnRiver) btnRiver.addEventListener('click', () => {
+    riverMode = !riverMode;
+    if (riverMode) { sculptOn = true; applyControlMode(); refreshLookBtn(); btnDig.classList.remove('on'); btnRaise.classList.remove('on'); }
+    lastSpringU = -1; refreshRiverBtn();
+  });
   btnRain.addEventListener('click', () => {
     raining = !raining; simRain(raining ? 0.1 : 0);
     if (raining) { everRained = true; } else { settle = 1800; }
@@ -430,6 +458,7 @@ async function main() {
       (cpuSim as unknown as { terrainDirty: boolean }).terrainDirty = true;
       cpuSim!.drained = 0; cpuSim!.injected = 0;
     }
+    simClearSprings(); riverMode = false; refreshRiverBtn(); lastSpringU = -1;
     raining = false; simRain(0); everRained = false; settle = 2;
     btnRain.textContent = '🌧 雨 OFF'; btnRain.classList.remove('on');
   });
@@ -461,12 +490,24 @@ async function main() {
     const a = gg(i0, j0) * (1 - tx) + gg(i1, j0) * tx, b = gg(i0, j1) * (1 - tx) + gg(i1, j1) * tx;
     return a * (1 - ty) + b * ty;
   };
+  // 村センサ用: 近傍ブロックの MAX(細い川が村センサに映る=GPU coarse max と同型)。
+  const CPU_MAX_RAD = Math.max(2, Math.round(SIM_N / 128));
+  const sampleCpuMax = (arr: Float32Array, n: number, u: number, v: number) => {
+    const ci = Math.round(Math.min(Math.max(u, 0), 1) * (n - 1)), cj = Math.round(Math.min(Math.max(v, 0), 1) * (n - 1));
+    let m = 0;
+    for (let dj = -CPU_MAX_RAD; dj <= CPU_MAX_RAD; dj++) for (let di = -CPU_MAX_RAD; di <= CPU_MAX_RAD; di++) {
+      const i = ci + di, j = cj + dj;
+      if (i < 0 || j < 0 || i >= n || j >= n) continue;
+      const val = arr[j * n + i]; if (val > m) m = val;
+    }
+    return m;
+  };
   const worldSensor: WorldSensor = {
     worldW, vertExag: VERT_EXAG, elevMin: hMin, elevMax: hMax,
     heightUV: (u, v) => simHeightUV(u, v), // 変形追従(彫った地形に村が追従)
 
-    waterUV: USE_GPU ? (u, v) => gpuSim!.sampleCoarse(u, v, 1) : (u, v) => sampleCpuField(cpuSim!.water, SIM_N, u, v),
-    wetUV: USE_GPU ? (u, v) => gpuSim!.sampleCoarse(u, v, 2) : (u, v) => sampleCpuField(cpuSim!.wet, SIM_N, u, v),
+    waterUV: USE_GPU ? (u, v) => gpuSim!.sampleCoarse(u, v, 1) : (u, v) => sampleCpuMax(cpuSim!.water, SIM_N, u, v),
+    wetUV: USE_GPU ? (u, v) => gpuSim!.sampleCoarse(u, v, 2) : (u, v) => sampleCpuMax(cpuSim!.wet, SIM_N, u, v),
   };
   let village: VillageSystem | null = null;
   let gameMode = false;
@@ -519,6 +560,21 @@ async function main() {
     seedRng(n: number) { ensureVillage(); village!.reseed(n); },
     // cap非依存検証用: 独立した村システム(sceneに追加しない)を生成
     _mkSim(maxPeople: number) { return new VillageSystem(worldSensor, { maxPeople }); },
+    // 神の川ツール
+    river: {
+      add: (u: number, v: number) => simAddSpring(u, v),
+      clear: () => simClearSprings(),
+      count: () => springCount(),
+      async flowFor(sec: number) {
+        const f = Math.round(sec * 60);
+        for (let k = 0; k < f; k++) { if (USE_GPU) gpuSim!.step(1, true); else { cpuSim!.step(1 / 60, 1); cpuSim!.sync(); } }
+        if (USE_GPU) { await gpuSim!.readCoarse(); coarseReady = true; }
+        await renderer.renderAsync(scene, camera);
+      },
+      waterAt: (u: number, v: number) => (USE_GPU ? gpuSim!.sampleCoarse(u, v, 1) : sampleCpuMax(cpuSim!.water, SIM_N, u, v)),
+      wetAt: (u: number, v: number) => (USE_GPU ? gpuSim!.sampleCoarse(u, v, 2) : sampleCpuMax(cpuSim!.wet, SIM_N, u, v)),
+      suitAt: (u: number, v: number) => { ensureVillage(); return village!._suit(u, v); },
+    },
     // カメラ検証用
     camera: {
       focusOn(u: number, v: number) { focusWorld(u * worldW - worldW / 2, worldW / 2 - v * worldW); },
@@ -580,16 +636,18 @@ async function main() {
     const dt = Math.min((now - last) / 1000, 1 / 20);
     last = now; uTime.value += dt;
 
-    const active = sculpting || raining || settle > 0;
+    const hasSprings = springCount() > 0;
+    const active = sculpting || raining || settle > 0 || hasSprings;
     if (active) {
       applyBrush(dt);
+      const wIter = (raining || everRained || hasSprings) ? 1 : 0;
       if (USE_GPU) {
-        gpuSim!.step((raining || everRained) ? 1 : 0, true);
+        gpuSim!.step(wIter, true);
       } else {
-        cpuSim!.step(dt, (raining || everRained) ? 1 : 0);
+        cpuSim!.step(dt, wIter);
         cpuSim!.sync();
       }
-      if (!sculpting && !raining && settle > 0) {
+      if (!sculpting && !raining && !hasSprings && settle > 0) {
         settle--;
         // 沈静化した瞬間に coarse を1発読み戻す=彫った地形に pick/カメラ/村が追従
         if (settle === 0 && USE_GPU) gpuSim!.readCoarse().then(() => { coarseReady = true; });

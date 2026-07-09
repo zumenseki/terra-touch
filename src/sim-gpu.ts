@@ -51,6 +51,7 @@ export class GpuSim {
   private uRain = uniform(0);
   private uBrush = uniform(new THREE.Vector4(0, 0, 0, 0)); // u, v, radius(m), amt
   private uBrushMode = uniform(1); // +1 dig / -1 raise
+  private uSource = uniform(new THREE.Vector4(0, 0, 1, 0)); // u, v, radius(m), volume(m³ this dispatch)
   private uScaleDig = uniform(1);  // 掘り時: 縁堆積スケール ΣW/ΣG
   private uScaleRaise = uniform(1); // 盛り時: 中心堆積スケール ΣG/ΣW
 
@@ -65,7 +66,11 @@ export class GpuSim {
   private kSlump1: any;
   private kSlump2: any;
   private kBrush: any;
+  private kSource: any;
   private kCopy: any;
+  // 神の川ツール: 恒常水源(spring)。step 毎に注入。q=m³/s。
+  springs: { u: number; v: number; q: number }[] = [];
+  springRad = 1;
   // 表示用テクスチャ: [地表高(bed+soil), water, wet, 1]。毎ステップ末に buffer からコピー。
   dispTex!: THREE.StorageTexture;
   // 村ロジック用の粗い世界センサ (縮約 coarseN²・低頻度読戻し)
@@ -86,6 +91,7 @@ export class GpuSim {
     this.uTalus.value = Math.tan(TALUS_ANGLE) * this.cell;
     this.brushRadius = opts.world / 40;
     this.digRate = this.brushRadius * 0.4;
+    this.springRad = Math.max(2 * this.cell, opts.world / 256);
 
     // 初期 state バッファ (bedrock を x に)
     const len = N * N;
@@ -123,6 +129,7 @@ export class GpuSim {
     const state = this.state, flux = this.flux, slump = this.slump;
     const uCell = this.uCell, uDt = this.uDt, uTalus = this.uTalus, uRain = this.uRain;
     const uBrush = this.uBrush, uBrushMode = this.uBrushMode;
+    const uSource = this.uSource;
     const uScaleDig = this.uScaleDig, uScaleRaise = this.uScaleRaise;
     const Ni = int(N);
     const Nf = float(N);
@@ -251,6 +258,21 @@ export class GpuSim {
       state.element(instanceIndex).assign(vec4(bed, soil, s.z, s.w));
     })().compute(N * N);
 
+    // ── 点源 (神の川ツール・恒常水源) ──
+    // 円錐 (1-(r/R)²) を disk 上に注入。∫cone dA=πR²/2 で正規化し体積 Q(m³)を water(m) に。
+    this.kSource = Fn(() => {
+      const { i, j } = ijOf();
+      const bi = uSource.x.mul(Nf.sub(float(1)));
+      const bj = uSource.y.mul(Nf.sub(float(1)));
+      const R = uSource.z, Q = uSource.w; // Q = 水深レート×dt (m)
+      const r = length(vec2(float(i).sub(bi), float(j).sub(bj))).mul(uCell);
+      const rn = r.div(R);
+      const t = float(1).sub(rn.mul(rn));
+      const wgt = select(r.lessThan(R), max(float(0), t), float(0)); // 円錐 0..1
+      const s = state.element(instanceIndex);
+      state.element(instanceIndex).assign(vec4(s.x, s.y, s.z.add(Q.mul(wgt)), s.w));
+    })().compute(N * N);
+
     // ── 表示テクスチャへコピー ([bed+soil, water, wet, 1]) ──
     const dispTex = this.dispTex;
     this.kCopy = Fn(() => {
@@ -270,13 +292,19 @@ export class GpuSim {
     const coarseBuf = this.coarseBuf;
     const CN = int(this.coarseN);
     const scale = int(Math.floor(N / this.coarseN));
+    // 縮約: 高さ=中心点(pick/カメラの回帰維持)。water/wet=ブロック内9点の MAX
+    // (細い川がブロックのどこかにあれば村センサに映る=SPEC 8×8 max プーリング)。
     this.kCoarse = Fn(() => {
       const ci = int(instanceIndex.mod(uint(this.coarseN)));
       const cj = int(instanceIndex.div(uint(this.coarseN)));
-      const fi = ci.mul(scale).add(scale.div(int(2)));
-      const fj = cj.mul(scale).add(scale.div(int(2)));
-      const s = state.element(uint(fj.mul(Ni).add(fi)));
-      coarseBuf.element(instanceIndex).assign(vec4(s.x.add(s.y), s.z, s.w, float(0)));
+      const bi = ci.mul(scale), bj = cj.mul(scale);
+      const o0 = scale.div(int(6)), o1 = scale.div(int(2)), o2 = scale.mul(int(5)).div(int(6));
+      const at = (ox: any, oy: any) => state.element(uint(min(bj.add(oy), Ni.sub(int(1))).mul(Ni).add(min(bi.add(ox), Ni.sub(int(1))))));
+      const c = at(o1, o1); // 中心 = 高さ用
+      const ss = [at(o0, o0), at(o1, o0), at(o2, o0), at(o0, o1), c, at(o2, o1), at(o0, o2), at(o1, o2), at(o2, o2)];
+      let wMax = ss[0].z, wetMax = ss[0].w;
+      for (let k = 1; k < 9; k++) { wMax = max(wMax, ss[k].z); wetMax = max(wetMax, ss[k].w); }
+      coarseBuf.element(instanceIndex).assign(vec4(c.x.add(c.y), wMax, wetMax, float(0)));
     })().compute(this.coarseN * this.coarseN);
     void CN;
   }
@@ -293,6 +321,10 @@ export class GpuSim {
     if (doSlump) { r.compute(this.kSlump1); r.compute(this.kSlump2); }
     for (let k = 0; k < waterIters; k++) {
       if (this.rainRate > 0) { this.uRain.value = this.rainRate; r.compute(this.kRain); }
+      for (const sp of this.springs) {
+        (this.uSource.value as THREE.Vector4).set(sp.u, sp.v, this.springRad, sp.q * SIM_DT);
+        r.compute(this.kSource);
+      }
       r.compute(this.kFlux);
       r.compute(this.kDepth);
     }
