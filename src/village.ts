@@ -33,12 +33,26 @@ const MAX_AGENTS = 1024;           // 村あたり個体上限(暴走防止)
 const DEATH_FADE = 2.0;            // 死亡フェード(実秒)
 const INFANT_HIDE = 3;             // age<3 は非表示
 
+// ── N2 食料経済 (SPEC-life-sim §3,4) ──
+// GATHER_BASE: 実地形較正値。富士は乾燥急峻で suitability が最大0.5/平均0.25。
+// SPEC理論値1.6(損益分岐s=0.625)は実地形で全村即絶滅→3.2に較正(損益分岐s≈0.31・
+// 最良flat地~40人上限)。水(川/雨)で suitability が上がるほど繁栄=設計意図どおり。
+const GATHER_BASE = 3.2;           // fu / gatherer年 (× suitability)
+const STORE_PER_HUT = 4.0;         // 家1軒あたり食料貯蔵上限 (fu)
+const M_STARVE = 0.4;              // 飢餓死係数 / 年
+const HUNGER_RATE = 3;             // hungerY += dtY*3*(1-nutrition)
+const CONS_KID = 0.5, CONS_ADULT = 1.0, CONS_ELDER = 0.7; // 消費 fu/年
+const LABOR_ELDER = 0.5;           // 老人の労働係数
+
 function hazardAt(ay: number): number {
   if (ay <= 0) return 0.12;
   if (ay <= 4) return 0.03;
   if (ay <= 14) return 0.008;
   return 0.006;
 }
+const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
+// 家数(N2自動)。人口より先行させ E_house≈1 に保つ(鶏卵回避)。家の律速は N4 で実装。
+const autoHuts = (pop: number) => Math.min(12, Math.max(2, Math.ceil(pop / 6) + 1));
 
 // 個体台帳。1体≈48B。同一性=id。
 interface LifeAgent {
@@ -55,6 +69,7 @@ interface Village {
   u: number; v: number; huts: number; age: number;
   agents: LifeAgent[]; birthAcc: number;
   kids: number; adultsF: number; adultsM: number; elders: number;
+  foodStock: number; hungerY: number; surplusY: number; deathAcc: number;
 }
 interface Band { u: number; v: number; wander: number; tu?: number; tv?: number; agents: LifeAgent[]; }
 
@@ -114,6 +129,9 @@ export class VillageSystem {
   private totalDeaths = 0;
   private recordDeaths = false;
   private deathLog: number[] = [];
+  // 検証用フラグ(通常は無効)
+  private testHuts = -1;      // >=0 で huts 固定
+  private testInfFood = false; // true で食料無限(飢餓なし・nutrition=1)
 
   constructor(sensor: WorldSensor, opts?: { maxPeople?: number; seed?: number }) {
     this.sensor = sensor;
@@ -266,9 +284,7 @@ export class VillageSystem {
       const du = (band.tu ?? band.u) - band.u, dv = (band.tv ?? band.v) - band.v;
       const dist = Math.hypot(du, dv);
       if (dist < stepUv * 1.5 || band.wander > 14) {
-        const vg: Village = { u: band.u, v: band.v, huts: 1, age: 0, agents: band.agents, birthAcc: 0, kids: 0, adultsF: 0, adultsM: 0, elders: 0 };
-        this.recomputeDemo(vg);
-        vg.huts = Math.min(12, Math.max(1, Math.floor(vg.agents.length / 6) + 1));
+        const vg = this.makeVillage(band.u, band.v, band.agents);
         this.villages.push(vg);
         // band に紐付いた体を村へ移管
         for (const a of band.agents) if (a.body >= 0) { const p = this.pool[a.body]; if (p) { p.homeRef = vg; p.homeKind = 'village'; } }
@@ -283,9 +299,12 @@ export class VillageSystem {
   private simTick() {
     for (const vg of this.villages) {
       vg.agents = this.ageAndDie(vg.agents);
-      this.birthsIn(vg);
+      vg.huts = this.testHuts >= 0 ? this.testHuts : autoHuts(vg.agents.length);
       this.recomputeDemo(vg);
-      vg.huts = Math.min(12, Math.max(1, Math.floor(vg.agents.length / 6) + 1));
+      const econ = this.economy(vg);       // 採集/消費/貯蔵/飢餓死
+      this.recomputeDemo(vg);              // 飢餓死後の demo
+      this.birthsIn(vg, econ.intakeRate, econ.upkeep); // 完全B式
+      this.recomputeDemo(vg);              // 出産後の最終 demo
       vg.age += DT_Y;
     }
     for (const bd of this.bands) bd.agents = this.ageAndDie(bd.agents);
@@ -315,28 +334,94 @@ export class VillageSystem {
     return survivors;
   }
 
-  // 出産(N1簡易版: B = fertBase * eligibleF * E_pair・環境ゲート無し)
-  private birthsIn(vg: Village) {
+  // 食料経済(N2: 採集のみ・魚/狩/建築は N4/N6)。飢餓死まで処理し {intakeRate, upkeep} を返す。
+  private economy(vg: Village): { intakeRate: number; upkeep: number } {
+    const kids = vg.kids, adults = vg.adultsF + vg.adultsM, elders = vg.elders;
+    const labor = adults + LABOR_ELDER * elders;
+    const upkeep = kids * CONS_KID + adults * CONS_ADULT + elders * CONS_ELDER; // fu/年
+    const storageCap = vg.huts * STORE_PER_HUT;
+    // N2 は全労働が採集(builders/fishers/hunters は N4/N6 で導入)
+    const Wg = labor;
+    const effW = Math.min(Wg, 12) + 0.25 * Math.max(0, Wg - 12); // 収穫逓減
+    const s = this.suitability(vg.u, vg.v);
+    const intakeRate = GATHER_BASE * effW * s; // fu/年
+    if (this.testInfFood) {
+      vg.foodStock = storageCap; vg.hungerY = 0; vg.deathAcc = 0; vg.surplusY += DT_Y;
+      return { intakeRate: Math.max(intakeRate, upkeep * 1.2), upkeep };
+    }
+    const intake = intakeRate * DT_Y;
+    const need = upkeep * DT_Y;
+    const supply = vg.foodStock + intake;
+    const eaten = Math.min(need, supply);
+    const nutrition = need > 0 ? eaten / need : 1;
+    vg.foodStock = Math.min(storageCap, supply - eaten);
+    if (nutrition < 1) vg.hungerY += DT_Y * HUNGER_RATE * (1 - nutrition);
+    else vg.hungerY = Math.max(0, vg.hungerY - DT_Y);
+    vg.surplusY = (intake >= 1.1 * need) ? vg.surplusY + DT_Y : 0;
+    // 飢餓死(高齢順・繁殖適齢Fは他が尽きるまで温存)
+    vg.deathAcc += vg.agents.length * M_STARVE * (1 - nutrition) * DT_Y;
+    let guard = 0;
+    while (vg.deathAcc >= 1 && vg.agents.length > 0 && guard++ < MAX_AGENTS) { vg.deathAcc -= 1; this.starve(vg); }
+    return { intakeRate, upkeep };
+  }
+
+  private starve(vg: Village) {
+    let victim = -1, bestAge = -1;
+    for (let i = 0; i < vg.agents.length; i++) {
+      const a = vg.agents[i];
+      if (a.sex === 0 && a.age >= FERT_MIN && a.age <= FERT_MAX) continue; // 繁殖適齢Fは温存
+      if (a.age > bestAge) { bestAge = a.age; victim = i; }
+    }
+    if (victim < 0) for (let i = 0; i < vg.agents.length; i++) if (vg.agents[i].age > bestAge) { bestAge = vg.agents[i].age; victim = i; }
+    if (victim >= 0) {
+      const a = vg.agents[victim];
+      this.totalDeaths++; if (this.recordDeaths) this.deathLog.push(a.age); if (a.body >= 0) this.killBody(a);
+      vg.agents.splice(victim, 1);
+    }
+  }
+
+  // 出産(N2 完全版: B = fertBase*eligibleF*E_food*E_house*E_pair*E_size*E_div)
+  private birthsIn(vg: Village, intakeRate: number, upkeep: number) {
+    const agents = vg.agents;
     let m15 = 0, f15 = 0, eligF = 0;
-    for (const a of vg.agents) {
+    const lineSet = new Set<number>();
+    for (const a of agents) {
+      lineSet.add(a.line);
       if (a.age >= ADULT_AGE) { if (a.sex === 1) m15++; else f15++; }
       if (a.sex === 0 && a.age >= FERT_MIN && a.age <= FERT_MAX && a.preg <= 0) eligF++;
     }
+    const pop = agents.length, adults = m15 + f15, lines = lineSet.size;
+    const up = Math.max(1e-6, upkeep);
     const ePair = (m15 + f15 > 0) ? 2 * Math.min(m15, f15) / (m15 + f15) : 0;
-    vg.birthAcc += FERT_BASE * eligF * ePair * DT_Y;
+    const eHouse = clamp((vg.huts * 6 - pop) / 6, 0, 1);
+    const eSize = clamp(adults / 4, 0, 1);
+    const eDiv = clamp(0.5 + 0.166 * (lines - 1), 0.5, 1.0);
+    const eFood = this.testInfFood ? 1
+      : clamp((vg.foodStock / up + 0.5 * Math.max(0, intakeRate / up - 1) - 0.1) / 0.3, 0, 1);
+    vg.birthAcc += FERT_BASE * eligF * eFood * eHouse * ePair * eSize * eDiv * DT_Y;
     const diff = m15 - f15;
-    while (vg.birthAcc >= 1 && vg.agents.length < MAX_AGENTS) {
+    while (vg.birthAcc >= 1 && agents.length < MAX_AGENTS) {
       vg.birthAcc -= 1;
       let sex: 0 | 1;
       if (Math.abs(diff) > 3) { const minority: 0 | 1 = diff > 0 ? 0 : 1; sex = this.rngSim() < 0.7 ? minority : (minority === 0 ? 1 : 0); }
       else sex = this.rngSim() < 0.5 ? 0 : 1;
       const span = SPAN_MIN + this.rngSim() * SPAN_RANGE;
       let motherLine = -1;
-      for (const a of vg.agents) { if (a.sex === 0 && a.age >= FERT_MIN && a.age <= FERT_MAX && a.preg <= 0) { a.preg = PREG_CD; motherLine = a.line; break; } }
+      for (const a of agents) { if (a.sex === 0 && a.age >= FERT_MIN && a.age <= FERT_MAX && a.preg <= 0) { a.preg = PREG_CD; motherLine = a.line; break; } }
       const line = (this.rngSim() < LINE_MUT || motherLine < 0) ? this.nextLine++ : motherLine;
-      vg.agents.push({ id: this.nextId++, age: 0, sex, span, preg: 0, line, body: -1 });
+      agents.push({ id: this.nextId++, age: 0, sex, span, preg: 0, line, body: -1 });
       this.totalBirths++;
     }
+  }
+
+  private makeVillage(u: number, v: number, agents: LifeAgent[]): Village {
+    const huts = autoHuts(agents.length);
+    const vg: Village = {
+      u, v, huts, age: 0, agents, birthAcc: 0, kids: 0, adultsF: 0, adultsM: 0, elders: 0,
+      foodStock: huts * STORE_PER_HUT, hungerY: 0, surplusY: 0, deathAcc: 0,
+    };
+    this.recomputeDemo(vg);
+    return vg;
   }
 
   private recomputeDemo(vg: Village) {
@@ -493,14 +578,15 @@ export class VillageSystem {
   }
 
   stats() {
-    let pop = 0, kids = 0, adults = 0, elders = 0;
-    for (const v of this.villages) { pop += v.agents.length; kids += v.kids; adults += v.adultsF + v.adultsM; elders += v.elders; }
+    let pop = 0, kids = 0, adults = 0, elders = 0, food = 0;
+    for (const v of this.villages) { pop += v.agents.length; kids += v.kids; adults += v.adultsF + v.adultsM; elders += v.elders; food += v.foodStock; }
     for (const b of this.bands) pop += b.agents.length;
     return {
       villages: this.villages.length, pop, bands: this.bands.length,
       year: Math.round(this.clock() * 1000) / 1000,
       births: this.totalBirths, deaths: this.totalDeaths,
       kids, adults, elders,
+      food: Math.round(food * 100) / 100,
     };
   }
 
@@ -509,8 +595,7 @@ export class VillageSystem {
   _counts() { return { founders: this.totalFounders, births: this.totalBirths, deaths: this.totalDeaths, live: this._live() }; }
   _injectVillage(u: number, v: number, specs: { age: number; sex: 0 | 1 }[]) {
     const agents = specs.map((s) => this.newFounder(s.age, s.sex));
-    const vg: Village = { u, v, huts: 1, age: 0, agents, birthAcc: 0, kids: 0, adultsF: 0, adultsM: 0, elders: 0 };
-    this.recomputeDemo(vg); this.villages.push(vg); return vg;
+    const vg = this.makeVillage(u, v, agents); this.villages.push(vg); return vg;
   }
   _startDeathLog() { this.recordDeaths = true; this.deathLog = []; }
   _deathAges(): number[] { return this.deathLog; }
@@ -524,4 +609,12 @@ export class VillageSystem {
     return true;
   }
   _ageRangeOK(): boolean { for (const v of this.villages) for (const a of v.agents) if (!(a.age >= 0 && a.age < MAX_AGE + DT_Y)) return false; return true; }
+  _setTestHuts(n: number) { this.testHuts = n; }
+  _setInfFood(b: boolean) { this.testInfFood = b; }
+  _villageFood(i: number): number { return this.villages[i]?.foodStock ?? 0; }
+  _villageHunger(i: number): number { return this.villages[i]?.hungerY ?? 0; }
+  _lines(i: number): number { const v = this.villages[i]; if (!v) return 0; const s = new Set<number>(); for (const a of v.agents) s.add(a.line); return s.size; }
+  _suit(u: number, v: number): number { return this.suitability(u, v); }
+  _villageDemo(i: number) { const v = this.villages[i]; if (!v) return null; return { pop: v.agents.length, kids: v.kids, af: v.adultsF, am: v.adultsM, elders: v.elders, food: Math.round(v.foodStock * 100) / 100, hunger: Math.round(v.hungerY * 100) / 100, huts: v.huts }; }
+  _bestSuit(): number { let best = 0; const N = 40; for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) { const s = this.suitability((i + 0.5) / N, (j + 0.5) / N); if (s > best) best = s; } return best; }
 }
