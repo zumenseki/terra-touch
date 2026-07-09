@@ -73,21 +73,22 @@ interface Village {
 }
 interface Band { u: number; v: number; wander: number; tu?: number; tv?: number; agents: LifeAgent[]; }
 
+// N3: 体は部位別InstancedMesh(全人物で共有)。Person は論理状態+外見パラメータのみ。
 interface Person {
-  group: THREE.Group;
-  legL: THREE.Group; legR: THREE.Group;
-  armL: THREE.Group; armR: THREE.Group;
-  body: THREE.Object3D;
-  idx: number;               // pool 内の固定添字
+  idx: number;               // pool 内=instance 添字(固定)
   agent: LifeAgent | null;   // この体が表す個体
   active: boolean;
   dying: boolean;            // 死亡フェード中
+  fade: number;              // 表示スケール係数 (1=通常, 0=消滅)
   homeRef: Village | Band | null;
   homeKind: 'village' | 'band' | null;
   u: number; v: number; tu: number; tv: number;
   state: 'walk' | 'pause';
   timer: number; speed: number; phase: number; facing: number;
   fx: number; fy: number; // band 隊列オフセット
+  // 外見(体を借りた時に agent から決定・見た目の個体差/性差)
+  sex: 0 | 1; skinIdx: number; hairLong: boolean;
+  heightScale: number; shoulderW: number; hipW: number; gait: number;
 }
 
 const MAX_HUTS = 1500;
@@ -114,6 +115,26 @@ export class VillageSystem {
   private t = 0;
   private pool: Person[] = [];
   private dyingList: { p: Person; t: number }[] = [];
+
+  // N3: 部位別InstancedMesh(全人物共有・draw call ~10)
+  private partLegL!: THREE.InstancedMesh; private partLegR!: THREE.InstancedMesh;
+  private partArmL!: THREE.InstancedMesh; private partArmR!: THREE.InstancedMesh;
+  private partTorso!: THREE.InstancedMesh; private partHead!: THREE.InstancedMesh;
+  private partHairS!: THREE.InstancedMesh; private partHairL!: THREE.InstancedMesh;
+  private partClothM!: THREE.InstancedMesh; private partClothF!: THREE.InstancedMesh;
+  private skinParts: THREE.InstancedMesh[] = [];
+  private allParts: THREE.InstancedMesh[] = [];
+  private personsDirty = true;
+  private hutSig = '';
+  // 人体寸法(buildPeople で確定)
+  private H = 0; private hipY = 0; private torsoH = 0;
+  // 再利用行列
+  private mRoot = new THREE.Matrix4(); private mLocal = new THREE.Matrix4(); private mOut = new THREE.Matrix4();
+  private qTmp = new THREE.Quaternion(); private eTmp = new THREE.Euler();
+  private vTmp = new THREE.Vector3(); private vScl = new THREE.Vector3(); private vPos = new THREE.Vector3();
+  private cTmp = new THREE.Color();
+  private mZero = new THREE.Matrix4().makeScale(0, 0, 0);
+  private skinCols = [0xb98a5e, 0xa9764a, 0xc79b6e];
   private maxPeople: number;
   private stride: number;
   private rngSim: () => number;   // 生命/経済/出産/死 (cap非依存)
@@ -164,38 +185,65 @@ export class VillageSystem {
     const armLen = H * 0.40, armR = H * 0.032;
     const torsoH = H * 0.30;
     const hipY = legLen;
-    const skins = [0xb98a5e, 0xa9764a, 0xc79b6e].map((c) => new THREE.MeshStandardNodeMaterial({ color: c, roughness: 0.85 }));
+    this.H = H; this.hipY = hipY; this.torsoH = torsoH;
+
+    // ── 部位ジオメトリ(各パーツは自身の pivot 原点で作る) ──
+    const legCap = new THREE.CapsuleGeometry(legR, legLen - 2 * legR, 4, 7); legCap.translate(0, -legLen / 2 + legR, 0);
+    const footGeo = new THREE.BoxGeometry(legR * 2, legR * 1.1, legR * 2.6); footGeo.translate(0, -legLen + legR * 0.5, legR * 0.6);
+    const legGeo = mergeGeometries([legCap, footGeo])!;                 // 脚+足(pivot=股関節)
+    const armGeo = new THREE.CapsuleGeometry(armR, armLen - 2 * armR, 4, 7); armGeo.translate(0, -armLen / 2 + armR, 0); // pivot=肩
+    const torsoGeo = new THREE.CapsuleGeometry(H * 0.095, torsoH - H * 0.095, 5, 9);
+    const headGeo = new THREE.SphereGeometry(H * 0.088, 12, 10);
+    const hairSGeo = new THREE.SphereGeometry(H * 0.096, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.62); // 短髪(浅い帽)
+    const hairLGeo = new THREE.SphereGeometry(H * 0.10, 12, 10, 0, Math.PI * 2, 0, Math.PI * 0.95);  // 長髪(深い帽=後ろ髪)
+    const clothMGeo = new THREE.CylinderGeometry(H * 0.11, H * 0.125, H * 0.14, 9);                  // 腰巻(男)
+    const clothFGeo = new THREE.CylinderGeometry(H * 0.10, H * 0.17, H * 0.24, 10); clothFGeo.translate(0, -H * 0.05, 0); // スカート(女)
+
+    const skinMat = new THREE.MeshStandardNodeMaterial({ roughness: 0.85 });   // 肌=instanceColor で個体差
     const hairMat = new THREE.MeshStandardNodeMaterial({ color: 0x201510, roughness: 1 });
     const clothMat = new THREE.MeshStandardNodeMaterial({ color: 0x6b4a2e, roughness: 1 });
 
-    const legGeo = new THREE.CapsuleGeometry(legR, legLen - 2 * legR, 4, 7); legGeo.translate(0, -legLen / 2 + legR, 0);
-    const armGeo = new THREE.CapsuleGeometry(armR, armLen - 2 * armR, 4, 7); armGeo.translate(0, -armLen / 2 + armR, 0);
-    const torsoGeo = new THREE.CapsuleGeometry(H * 0.095, torsoH - H * 0.095, 5, 9);
-    const headGeo = new THREE.SphereGeometry(H * 0.088, 12, 10);
-    const hairGeo = new THREE.SphereGeometry(H * 0.096, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.62);
-    const clothGeo = new THREE.CylinderGeometry(H * 0.11, H * 0.125, H * 0.14, 9);
-    const footGeo = new THREE.BoxGeometry(legR * 2, legR * 1.1, legR * 2.6); footGeo.translate(0, -legLen + legR * 0.5, legR * 0.6);
+    const N = this.maxPeople;
+    const mk = (geo: THREE.BufferGeometry, mat: THREE.Material, skin: boolean): THREE.InstancedMesh => {
+      const m = new THREE.InstancedMesh(geo, mat, N);
+      m.frustumCulled = false; m.count = N;
+      for (let i = 0; i < N; i++) m.setMatrixAt(i, this.mZero);
+      m.instanceMatrix.needsUpdate = true;
+      if (skin) { for (let i = 0; i < N; i++) m.setColorAt(i, this.cTmp.setHex(0xb98a5e)); if (m.instanceColor) m.instanceColor.needsUpdate = true; }
+      this.group.add(m); this.allParts.push(m);
+      return m;
+    };
+    this.partLegL = mk(legGeo, skinMat, true); this.partLegR = mk(legGeo, skinMat, true);
+    this.partArmL = mk(armGeo, skinMat, true); this.partArmR = mk(armGeo, skinMat, true);
+    this.partTorso = mk(torsoGeo, skinMat, true); this.partHead = mk(headGeo, skinMat, true);
+    this.partHairS = mk(hairSGeo, hairMat, false); this.partHairL = mk(hairLGeo, hairMat, false);
+    this.partClothM = mk(clothMGeo, clothMat, false); this.partClothF = mk(clothFGeo, clothMat, false);
+    this.skinParts = [this.partLegL, this.partLegR, this.partArmL, this.partArmR, this.partTorso, this.partHead];
 
-    for (let i = 0; i < this.maxPeople; i++) {
-      const skin = skins[i % skins.length];
-      const g = new THREE.Group();
-      const mkLeg = (x: number) => { const p = new THREE.Group(); p.position.set(x, hipY, 0); p.add(new THREE.Mesh(legGeo, skin)); p.add(new THREE.Mesh(footGeo, skin)); g.add(p); return p; };
-      const legL = mkLeg(-H * 0.045), legR2 = mkLeg(H * 0.045);
-      const body = new THREE.Group();
-      const torso = new THREE.Mesh(torsoGeo, skin); torso.position.y = hipY + torsoH * 0.5; body.add(torso);
-      const cloth = new THREE.Mesh(clothGeo, clothMat); cloth.position.y = hipY + H * 0.02; body.add(cloth);
-      const head = new THREE.Mesh(headGeo, skin); head.position.y = hipY + torsoH + H * 0.1; body.add(head);
-      const hair = new THREE.Mesh(hairGeo, hairMat); hair.position.y = hipY + torsoH + H * 0.12; body.add(hair);
-      const mkArm = (x: number) => { const p = new THREE.Group(); p.position.set(x, hipY + torsoH * 0.92, 0); p.add(new THREE.Mesh(armGeo, skin)); body.add(p); return p; };
-      const armL = mkArm(-H * 0.12), armR3 = mkArm(H * 0.12);
-      g.add(body); g.visible = false; this.group.add(g);
+    for (let i = 0; i < N; i++) {
       this.pool.push({
-        group: g, legL, legR: legR2, armL, armR: armR3, body,
         idx: i, agent: null,
-        active: false, dying: false, homeRef: null, homeKind: null,
+        active: false, dying: false, fade: 1,
+        homeRef: null, homeKind: null,
         u: 0, v: 0, tu: 0, tv: 0, state: 'walk', timer: 0, speed: 0.007, phase: i * 1.7, facing: 0, fx: 0, fy: 0,
+        sex: 1, skinIdx: 0, hairLong: false, heightScale: 1, shoulderW: 1, hipW: 1, gait: 1,
       });
     }
+  }
+
+  // agent の同一性から決定論的に外見を導出(rng不使用=cap非依存・体を借り直しても不変)
+  private setAppearance(p: Person, a: LifeAgent) {
+    const h1 = (a.id * 2654435761) >>> 0, h2 = (a.id * 40503 + 12345) >>> 0, h3 = (a.id * 2246822519) >>> 0;
+    p.sex = a.sex;
+    p.skinIdx = h1 % 3;
+    p.hairLong = a.sex === 0 ? (h2 % 4 !== 0) : (h2 % 5 === 0); // 女=長髪多め/男=たまに
+    p.heightScale = 0.92 + (h3 % 100) / 100 * 0.16;             // 0.92-1.08
+    p.shoulderW = a.sex === 1 ? 1.12 : 0.85;                    // 男=肩広
+    p.hipW = a.sex === 0 ? 1.22 : 1.0;                          // 女=腰広
+    p.gait = a.sex === 1 ? 1.15 : 0.85;                         // 男=大股/女=小股
+    // 肌色を各 skin パーツへ
+    const col = this.cTmp.setHex(this.skinCols[p.skinIdx]);
+    for (const m of this.skinParts) { m.setColorAt(p.idx, col); if (m.instanceColor) m.instanceColor.needsUpdate = true; }
   }
 
   // ── 個体生成 ──
@@ -220,8 +268,9 @@ export class VillageSystem {
 
   clear() {
     this.villages = []; this.bands = []; this.dyingList = [];
-    this.hutMesh.count = 0; this.fireMesh.count = 0;
-    for (const p of this.pool) { p.active = false; p.dying = false; p.homeRef = null; p.homeKind = null; p.agent = null; p.group.visible = false; p.group.scale.setScalar(1); }
+    this.hutMesh.count = 0; this.fireMesh.count = 0; this.hutSig = '';
+    for (const p of this.pool) { p.active = false; p.dying = false; p.fade = 1; p.homeRef = null; p.homeKind = null; p.agent = null; }
+    for (const m of this.allParts) { for (let i = 0; i < this.maxPeople; i++) m.setMatrixAt(i, this.mZero); m.instanceMatrix.needsUpdate = true; }
     this.totalFounders = 0; this.totalBirths = 0; this.totalDeaths = 0;
     this.nextId = 1; this.nextLine = 1; this.simAcc = 0; this.ticksDone = 0;
     this.recordDeaths = false; this.deathLog = [];
@@ -258,6 +307,7 @@ export class VillageSystem {
 
     this.updateDying(dt);
     for (const p of this.pool) if (p.active && !p.dying && p.agent) this.updatePerson(p, dt);
+    this.renderPeople();
     this.renderStatic();
   }
 
@@ -443,35 +493,34 @@ export class VillageSystem {
   private assignBody(ref: Village | Band, kind: 'village' | 'band', a: LifeAgent): boolean {
     const p = this.pool.find((x) => !x.active);
     if (!p) return false;
-    p.active = true; p.dying = false; p.homeRef = ref; p.homeKind = kind; p.agent = a;
+    p.active = true; p.dying = false; p.fade = 1; p.homeRef = ref; p.homeKind = kind; p.agent = a;
     a.body = p.idx;
     p.u = ref.u; p.v = ref.v; p.tu = ref.u; p.tv = ref.v; p.state = 'pause'; p.timer = this.rngView() * 1.5;
     p.speed = 0.005 + this.rngView() * 0.006;
     p.fx = (this.rngView() - 0.5) * this.U * 0.7 / this.sensor.worldW;
     p.fy = (this.rngView() - 0.5) * this.U * 0.7 / this.sensor.worldW;
-    p.group.visible = true;
+    this.setAppearance(p, a);
     return true;
   }
   private releaseBody(a: LifeAgent) {
     if (a.body < 0) return;
     const p = this.pool[a.body];
-    if (p) { p.active = false; p.dying = false; p.agent = null; p.homeRef = null; p.homeKind = null; p.group.visible = false; p.group.scale.setScalar(1); }
+    if (p) { p.active = false; p.dying = false; p.agent = null; p.fade = 1; p.homeRef = null; p.homeKind = null; }
     a.body = -1;
   }
-  // 死亡した個体の体は 2 秒かけてフェード(rng不使用)
+  // 死亡した個体の体は 2 秒かけてフェード(rng不使用)。agent 参照は縮小描画用に保持。
   private killBody(a: LifeAgent) {
     if (a.body < 0) return;
     const p = this.pool[a.body];
-    if (p) { p.agent = null; p.dying = true; p.homeRef = null; p.homeKind = null; this.dyingList.push({ p, t: DEATH_FADE }); }
+    if (p) { p.dying = true; p.homeRef = null; p.homeKind = null; this.dyingList.push({ p, t: DEATH_FADE }); }
     a.body = -1;
   }
   private updateDying(dt: number) {
     for (let i = this.dyingList.length - 1; i >= 0; i--) {
       const d = this.dyingList[i]; d.t -= dt;
-      const s = Math.max(0, d.t / DEATH_FADE);
-      d.p.group.scale.setScalar(s);
+      d.p.fade = Math.max(0, d.t / DEATH_FADE);
       if (d.t <= 0) {
-        d.p.active = false; d.p.dying = false; d.p.group.visible = false; d.p.group.scale.setScalar(1);
+        d.p.active = false; d.p.dying = false; d.p.agent = null; d.p.fade = 1;
         this.dyingList.splice(i, 1);
       }
     }
@@ -512,8 +561,9 @@ export class VillageSystem {
     p.tv = Math.min(0.98, Math.max(0.02, vg.v + Math.sin(a) * r));
   }
 
+  // 論理更新のみ(移動/位相/向き)。描画は renderPeople が instance 行列へ。
   private updatePerson(p: Person, dt: number) {
-    const W = this.sensor.worldW, U = this.U, d = this.dummy;
+    const W = this.sensor.worldW;
     let moved = 0;
     if (p.homeKind === 'band' && p.homeRef) {
       const band = p.homeRef as Band;
@@ -530,18 +580,43 @@ export class VillageSystem {
         if (Math.hypot(du, dv) < p.speed * dt * 1.2) { p.state = 'pause'; p.timer = 0.6 + this.rngView() * 3; }
       }
     }
-    // 歩行アニメ
     p.phase += (moved * W) / this.stride;
-    const sw = Math.sin(p.phase) * 0.6;
-    p.legL.rotation.x = sw; p.legR.rotation.x = -sw;
-    p.armL.rotation.x = -sw * 0.7; p.armR.rotation.x = sw * 0.7;
-    p.body.position.y = Math.abs(Math.cos(p.phase)) * U * 0.03;
-    // 配置 + 年齢スケール(子は小さい)
-    this.pos(p.u, p.v, d.position);
-    p.group.position.copy(d.position);
-    p.group.rotation.y = p.facing;
-    if (p.agent) p.group.scale.setScalar(0.4 + 0.6 * Math.min(p.agent.age, 15) / 15);
   }
+
+  // 部位別 InstancedMesh へ全人物の行列を書き込む(毎フレーム=歩行アニメ)
+  private renderPeople() {
+    for (const p of this.pool) {
+      const i = p.idx;
+      if (!(p.active && p.agent)) { this.zeroPersonParts(i); continue; }
+      const ageScale = 0.4 + 0.6 * Math.min(p.agent.age, ADULT_AGE) / ADULT_AGE;
+      const s = p.fade * p.heightScale * ageScale;
+      if (s <= 0.001) { this.zeroPersonParts(i); continue; }
+      this.pos(p.u, p.v, this.vPos);
+      this.vPos.y += Math.abs(Math.cos(p.phase)) * this.U * 0.03 * s;
+      this.qTmp.setFromEuler(this.eTmp.set(0, p.facing, 0));
+      this.mRoot.compose(this.vPos, this.qTmp, this.vScl.set(s, s, s));
+      const sw = Math.sin(p.phase) * 0.6 * p.gait;
+      const H = this.H, hipY = this.hipY, torsoH = this.torsoH;
+      this.setPart(this.partLegL, i, -H * 0.045 * p.hipW, hipY, 0, sw, 1, 1, 1);
+      this.setPart(this.partLegR, i, H * 0.045 * p.hipW, hipY, 0, -sw, 1, 1, 1);
+      this.setPart(this.partArmL, i, -H * 0.12 * p.shoulderW, hipY + torsoH * 0.92, 0, -sw * 0.7, 1, 1, 1);
+      this.setPart(this.partArmR, i, H * 0.12 * p.shoulderW, hipY + torsoH * 0.92, 0, sw * 0.7, 1, 1, 1);
+      this.setPart(this.partTorso, i, 0, hipY + torsoH * 0.5, 0, 0, p.shoulderW, 1, 1);
+      this.setPart(this.partHead, i, 0, hipY + torsoH + H * 0.1, 0, 0, 1, 1, 1);
+      if (p.hairLong) { this.setPart(this.partHairL, i, 0, hipY + torsoH + H * 0.11, 0, 0, 1, 1, 1); this.partHairS.setMatrixAt(i, this.mZero); }
+      else { this.setPart(this.partHairS, i, 0, hipY + torsoH + H * 0.12, 0, 0, 1, 1, 1); this.partHairL.setMatrixAt(i, this.mZero); }
+      if (p.sex === 1) { this.setPart(this.partClothM, i, 0, hipY + H * 0.02, 0, 0, p.hipW, 1, p.hipW); this.partClothF.setMatrixAt(i, this.mZero); }
+      else { this.setPart(this.partClothF, i, 0, hipY + H * 0.02, 0, 0, p.hipW, 1, p.hipW); this.partClothM.setMatrixAt(i, this.mZero); }
+    }
+    for (const m of this.allParts) m.instanceMatrix.needsUpdate = true;
+  }
+  private setPart(mesh: THREE.InstancedMesh, i: number, ox: number, oy: number, oz: number, rotX: number, sx: number, sy: number, sz: number) {
+    this.qTmp.setFromEuler(this.eTmp.set(rotX, 0, 0));
+    this.mLocal.compose(this.vTmp.set(ox, oy, oz), this.qTmp, this.vScl.set(sx, sy, sz));
+    this.mOut.multiplyMatrices(this.mRoot, this.mLocal);
+    mesh.setMatrixAt(i, this.mOut);
+  }
+  private zeroPersonParts(i: number) { for (const m of this.allParts) m.setMatrixAt(i, this.mZero); }
 
   private stepToward(p: Person, step: number): number {
     const du = p.tu - p.u, dv = p.tv - p.v;
@@ -555,18 +630,24 @@ export class VillageSystem {
 
   private renderStatic() {
     const W = this.sensor.worldW, U = this.U, d = this.dummy;
-    let hi = 0;
-    for (const vg of this.villages) {
-      for (let k = 0; k < vg.huts && hi < MAX_HUTS; k++) {
-        const ang = k * 2.399963;
-        const rad = U * 1.3 * Math.sqrt(k);
-        const u = vg.u + (Math.cos(ang) * rad) / W, v = vg.v + (Math.sin(ang) * rad) / W;
-        this.pos(u, v, d.position); d.rotation.set(0, ang * 2.1, 0);
-        d.scale.setScalar(0.8 + 0.25 * ((k * 7) % 5) / 5); d.updateMatrix();
-        this.hutMesh.setMatrixAt(hi++, d.matrix);
+    // 家: 村構成が変わった時だけ再構築(ダーティフラグ)。
+    let sig = this.villages.length + '|';
+    for (const vg of this.villages) sig += vg.huts + ',' + Math.round(vg.u * 1e4) + ',' + Math.round(vg.v * 1e4) + ';';
+    if (sig !== this.hutSig) {
+      this.hutSig = sig;
+      let hi = 0;
+      for (const vg of this.villages) {
+        for (let k = 0; k < vg.huts && hi < MAX_HUTS; k++) {
+          const ang = k * 2.399963;
+          const rad = U * 1.3 * Math.sqrt(k);
+          const u = vg.u + (Math.cos(ang) * rad) / W, v = vg.v + (Math.sin(ang) * rad) / W;
+          this.pos(u, v, d.position); d.rotation.set(0, ang * 2.1, 0);
+          d.scale.setScalar(0.8 + 0.25 * ((k * 7) % 5) / 5); d.updateMatrix();
+          this.hutMesh.setMatrixAt(hi++, d.matrix);
+        }
       }
+      this.hutMesh.count = hi; this.hutMesh.instanceMatrix.needsUpdate = true;
     }
-    this.hutMesh.count = hi; this.hutMesh.instanceMatrix.needsUpdate = true;
     let fi = 0;
     for (const vg of this.villages) {
       if (fi >= MAX_FIRES) break;

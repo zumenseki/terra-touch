@@ -474,7 +474,7 @@ async function main() {
   const btnGame = document.getElementById('game')!;
   const btnSeed = document.getElementById('seed')!;
   const civEl = document.getElementById('civ')!;
-  const ensureVillage = () => { if (!village) { village = new VillageSystem(worldSensor, { maxPeople: IS_TOUCH ? 18 : 44 }); scene.add(village.group); } };
+  const ensureVillage = () => { if (!village) { village = new VillageSystem(worldSensor, { maxPeople: IS_TOUCH ? 28 : 64 }); scene.add(village.group); } };
   btnGame.addEventListener('click', () => {
     gameMode = !gameMode;
     btnGame.classList.toggle('on', gameMode);
