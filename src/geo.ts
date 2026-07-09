@@ -246,16 +246,17 @@ async function main() {
 
   // 深さで色 + フレネルで空 + 流れの速い所に白泡
   // 深い水は光を吸収=暗い。強い直射光(×3)で白飛びしないよう低アルベドに。
-  const baseWater = mix(vec3(0.035, 0.10, 0.13), vec3(0.008, 0.028, 0.06), smoothstep(0.4, 8.0, depth));
+  // 浅い水は明るい青(川として見える)→深い水は暗い。実機FBで浅水を明色化。
+  const baseWater = mix(vec3(0.12, 0.34, 0.5), vec3(0.01, 0.04, 0.09), smoothstep(0.3, 6.0, depth));
   const fresnel = float(1).sub(smoothstep(0.2, 0.85, wN.y));
-  const skyMix = mix(baseWater, vec3(0.24, 0.34, 0.46), fresnel.mul(0.18)); // 山岳谷の反射は落ち着いた青灰
+  const skyMix = mix(baseWater, vec3(0.35, 0.5, 0.62), fresnel.mul(0.22)); // 空の反射
   const foam = smoothstep(6.0, 8.0, spd).mul(0.12); // 最速部だけごく薄く白波
   wmat.colorNode = mix(skyMix, vec3(0.82, 0.88, 0.93), foam);
 
-  // ゲート: 深さ主体で川筋も見せる。ほぼ垂直な崖だけ膜を隠す。
+  // ゲート: 浅い流れも見せる(実機FBで閾値を下げ薄い水も表示)。ほぼ垂直な崖だけ膜を隠す。
   const gTerr = nrm(vec3(groundAt(-1, 0).sub(groundAt(1, 0)), cell * 2, groundAt(0, 1).sub(groundAt(0, -1))));
   const notCliff = smoothstep(0.26, 0.5, gTerr.y); // 崖(斜度~75°+)のみ0
-  wmat.opacityNode = smoothstep(0.18, 1.1, depth).mul(notCliff).mul(0.94);
+  wmat.opacityNode = smoothstep(0.06, 0.5, depth).mul(notCliff).mul(0.9);
   const waterMesh = new THREE.Mesh(wgeo, wmat);
   waterMesh.renderOrder = 1; scene.add(waterMesh);
 
@@ -401,7 +402,7 @@ async function main() {
 
   // ── 神の川ツール: 恒常水源(spring)。なぞった経路に水源を落とす。 ──
   const MAX_SPRINGS = IS_TOUCH ? 4 : 8;
-  const SPRING_Q = 1.5; // 水深レート m/s (雨0.1の局所強化版・セルサイズ非依存)。実機FBで0.4→1.5に増量
+  const SPRING_Q = 2.5; // 水深レート m/s。実機FBで0.4→1.5→2.5に増量(自然な溜まり/川に)
   let riverMode = false;
   let lastSpringU = -1, lastSpringV = -1;
   const springCount = () => (USE_GPU ? gpuSim!.springs.length : cpuSim!.springs.length);
@@ -412,10 +413,10 @@ async function main() {
   };
   const simClearSprings = () => { if (USE_GPU) gpuSim!.springs.length = 0; else cpuSim!.clearSprings(); };
 
-  // 水源マーカー: 水が出ている所に青く光る水柱(実機FB「水が出てるか見えない」対策)
-  const springGeo = new THREE.CylinderGeometry(worldW * 0.0012, worldW * 0.004, worldW * 0.02, 8);
-  springGeo.translate(0, worldW * 0.01, 0);
-  const springMat = new THREE.MeshBasicNodeMaterial({ color: 0x3fd0ff, transparent: true, opacity: 0.8 });
+  // 水源マーカー: 水面に寝た薄い波紋リング(前回の巨大円錐=不自然を廃止)
+  const springGeo = new THREE.TorusGeometry(worldW * 0.003, worldW * 0.0006, 6, 20);
+  springGeo.rotateX(Math.PI / 2); // 水平に寝かせる
+  const springMat = new THREE.MeshBasicNodeMaterial({ color: 0x9fe8ff, transparent: true, opacity: 0.5, depthWrite: false });
   const springMarks = new THREE.InstancedMesh(springGeo, springMat, MAX_SPRINGS);
   springMarks.frustumCulled = false; springMarks.count = MAX_SPRINGS; springMarks.renderOrder = 2;
   const _springDummy = new THREE.Object3D();
@@ -432,9 +433,9 @@ async function main() {
         if (USE_GPU) { u = gpuList![i].u; v = gpuList![i].v; }
         else { u = cpuList![i].i / (SIM_N - 1); v = cpuList![i].j / (SIM_N - 1); }
         const x = u * worldW - worldW / 2, z = worldW / 2 - v * worldW;
-        const pulse = 1 + 0.3 * Math.sin(t * 5 + i * 1.3);
-        _springDummy.position.set(x, sampleH(x, z), z);
-        _springDummy.scale.set(1, pulse, 1); _springDummy.rotation.set(0, 0, 0); _springDummy.updateMatrix();
+        const pulse = 0.7 + 0.45 * (0.5 + 0.5 * Math.sin(t * 3 + i * 1.3)); // 波紋の広がり(水平)
+        _springDummy.position.set(x, sampleH(x, z) + worldW * 0.003, z); // 水面付近
+        _springDummy.scale.set(pulse, 1, pulse); _springDummy.rotation.set(0, 0, 0); _springDummy.updateMatrix();
         springMarks.setMatrixAt(i, _springDummy.matrix);
       } else springMarks.setMatrixAt(i, _springZero);
     }
@@ -692,7 +693,7 @@ async function main() {
       }
       if (gameMode && village) {
         const s = village.stats();
-        civEl.textContent = `⏳${Math.floor(s.year)}y 🏘${s.villages} 👥${s.pop}${s.bands ? ` (移動中${s.bands})` : ''} 👶${s.kids} 🧑${s.adults} 👴${s.elders} 🌾${s.food} 🏚${s.huts} 🌲${s.trees} 🐟${s.fish} 🦌${s.animals}`;
+        civEl.textContent = `⏳${Math.floor(s.year)}y 🏘${s.villages} 👥${s.pop}${s.bands ? ` (移動中${s.bands})` : ''} 👶${s.kids} 🧑${s.adults} 👴${s.elders} 🌾${s.food} 🏚${s.huts} 🌲${s.trees} 🐟${s.fish} 🦌${s.animals}${s.migrations ? ` 🚶${s.migrations}` : ''}${s.atCapacity ? ' ⚠満' : ''}`;
       }
       frames = 0; statLast = now;
     }

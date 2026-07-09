@@ -60,6 +60,18 @@ function hazardAt(ay: number): number {
   return 0.006;
 }
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
+
+// ── N7 移住/分村/気候/respawn (SPEC-life-sim §8) ──
+const MIG_THRESHOLD = 1.5;   // hungerY がこれ以上で移住
+const MIG_COOLDOWN = 3;      // 移住後クールダウン(gameYear)
+const FISSION_POP = 45, FISSION_SURPLUS = 2; // 分村条件
+const RESPAWN_POP = 8, RESPAWN_SEC = 45;     // 全滅回避リスポーン
+const CLIMATE_AMP = 0.30, CLIMATE_PERIOD = 12; // 気候振動 ±30%・周期12年
+const BAND_FOOD_INIT = 6;    // seed/respawn band の初期携行食料
+// 気候 sineLUT (Math.sin は init のみ・tick 内は禁止=クロスプラットフォーム決定論)
+const CLIMATE_LUT = new Float32Array(256);
+for (let i = 0; i < 256; i++) CLIMATE_LUT[i] = Math.sin((i / 256) * Math.PI * 2);
+const hash01 = (n: number) => ((n * 2654435761) >>> 0) / 4294967296;
 // 家数(N2自動)。人口より先行させ E_house≈1 に保つ(鶏卵回避)。家の律速は N4 で実装。
 const autoHuts = (pop: number) => Math.min(12, Math.max(2, Math.ceil(pop / 6) + 1));
 
@@ -81,8 +93,13 @@ interface Village {
   kids: number; adultsF: number; adultsM: number; elders: number;
   foodStock: number; hungerY: number; surplusY: number; deathAcc: number;
   trees: number; site: BuildSite | null; // N4 建築
+  migCd: number; phi: number;            // N7 移住クールダウン(gameYear) / 気候位相
 }
-interface Band { u: number; v: number; wander: number; tu?: number; tv?: number; agents: LifeAgent[]; }
+interface Band {
+  u: number; v: number; wander: number; tu?: number; tv?: number; agents: LifeAgent[];
+  food: number; migCd: number;           // N7 携行食料 / 移住由来クールダウン
+  ox?: number; oy?: number;              // 移住元(移住bandはここから離れて再定住)
+}
 
 // N3: 体は部位別InstancedMesh(全人物で共有)。Person は論理状態+外見パラメータのみ。
 interface Person {
@@ -165,6 +182,9 @@ export class VillageSystem {
   private totalChopped = 0;      // 累計伐採丸太
   private totalTreesConsumed = 0;
   private hutsCompleted = 0;     // 建築で完成した軒数(初期credit除く)
+  private migrations = 0;        // N7 移住回数
+  private respawnAcc = 0;        // N7 リスポーン蓄積(gameYear)
+  atCapacity = false;            // MAX_AGENTS 到達(HUD表示用)
   private recordDeaths = false;
   private deathLog: number[] = [];
   // 検証用フラグ(通常は無効)
@@ -275,7 +295,7 @@ export class VillageSystem {
   seed(u: number, v: number) {
     const agents: LifeAgent[] = [];
     for (let i = 0; i < 4; i++) agents.push(this.newFounder(18 + this.rngSim() * 4, (i % 2 === 0 ? 0 : 1)));
-    this.bands.push({ u, v, wander: 0, agents });
+    this.bands.push({ u, v, wander: 0, agents, food: BAND_FOOD_INIT, migCd: 0 });
   }
 
   // 決定論再シード(検証・A/B比較用)。生命/表示の両乱数列を seed で固定。
@@ -294,6 +314,7 @@ export class VillageSystem {
     for (const m of this.allParts) { for (let i = 0; i < this.maxPeople; i++) m.setMatrixAt(i, this.mZero); m.instanceMatrix.needsUpdate = true; }
     this.totalFounders = 0; this.totalBirths = 0; this.totalDeaths = 0;
     this.totalChopped = 0; this.totalTreesConsumed = 0; this.hutsCompleted = 0;
+    this.migrations = 0; this.respawnAcc = 0; this.atCapacity = false;
     this.nextId = 1; this.nextLine = 1; this.simAcc = 0; this.ticksDone = 0;
     this.recordDeaths = false; this.deathLog = [];
   }
@@ -340,13 +361,15 @@ export class VillageSystem {
     for (let b = this.bands.length - 1; b >= 0; b--) {
       const band = this.bands[b];
       if (band.tu === undefined) {
-        let best = this.suitability(band.u, band.v) + 0.02, tu = band.u, tv = band.v;
+        const isMig = band.ox !== undefined;
+        let best = isMig ? 0 : this.suitability(band.u, band.v) + 0.02, tu = band.u, tv = band.v;
         for (let ri = 1; ri <= 5; ri++) {
           const rad = 0.05 * ri;
           for (let a = 0; a < 12; a++) {
             const ang = (a / 12) * Math.PI * 2 + ri * 0.7;
             const nu = band.u + Math.cos(ang) * rad, nv = band.v + Math.sin(ang) * rad;
             if (nu < 0.04 || nu > 0.96 || nv < 0.04 || nv > 0.96) continue;
+            if (isMig && Math.hypot(nu - band.ox!, nv - band.oy!) < 0.08) continue; // 元地の近くは避ける
             const s = this.suitability(nu, nv);
             if (s > best) { best = s; tu = nu; tv = nv; }
           }
@@ -357,7 +380,7 @@ export class VillageSystem {
       const du = (band.tu ?? band.u) - band.u, dv = (band.tv ?? band.v) - band.v;
       const dist = Math.hypot(du, dv);
       if (dist < stepUv * 1.5 || band.wander > 14) {
-        const vg = this.makeVillage(band.u, band.v, band.agents);
+        const vg = this.makeVillage(band.u, band.v, band.agents, band.migCd, Math.max(band.food, autoHuts(band.agents.length) * STORE_PER_HUT * 0.5));
         this.villages.push(vg);
         // band に紐付いた体を村へ移管
         for (const a of band.agents) if (a.body >= 0) { const p = this.pool[a.body]; if (p) { p.homeRef = vg; p.homeKind = 'village'; } }
@@ -382,16 +405,72 @@ export class VillageSystem {
       this.recomputeDemo(vg);              // 飢餓死後の demo
       this.birthsIn(vg, econ.intakeRate, econ.upkeep); // 完全B式
       this.recomputeDemo(vg);              // 出産後の最終 demo
-      vg.age += DT_Y;
+      vg.age += DT_Y; vg.migCd = Math.max(0, vg.migCd - DT_Y);
     }
-    for (const bd of this.bands) bd.agents = this.ageAndDie(bd.agents);
+    // band: 加齢 + 携行食料消費(尽きたら餓死) + クールダウン
+    for (const bd of this.bands) {
+      bd.agents = this.ageAndDie(bd.agents);
+      bd.migCd = Math.max(0, bd.migCd - DT_Y);
+      bd.food -= bd.agents.length * CONS_ADULT * DT_Y;
+      if (bd.food < 0) { bd.food = 0; this.starveBand(bd); }
+    }
     // 消滅村/空band を除去
     for (let i = this.villages.length - 1; i >= 0; i--) {
       if (this.villages[i].agents.length < VILLAGE_MIN_POP) { this.dissolveVillage(this.villages[i]); this.villages.splice(i, 1); }
     }
     for (let i = this.bands.length - 1; i >= 0; i--) if (this.bands[i].agents.length === 0) this.bands.splice(i, 1);
+
+    this.migrateAndFission();  // N7 破綻→移住 / 繁栄→分村
+    this.respawnIfEmpty();     // N7 全滅回避リスポーン
+
     this.reconcileBodies();
     this.eco.render();
+  }
+
+  private starveBand(bd: Band) {
+    let victim = -1, bestAge = -1;
+    for (let i = 0; i < bd.agents.length; i++) if (bd.agents[i].age > bestAge) { bestAge = bd.agents[i].age; victim = i; }
+    if (victim >= 0) { const a = bd.agents[victim]; this.totalDeaths++; if (a.body >= 0) this.killBody(a); bd.agents.splice(victim, 1); }
+  }
+
+  // 破綻→移住(村→band退行) / 繁栄→分村(30%を新band・新line)
+  private migrateAndFission() {
+    for (let i = this.villages.length - 1; i >= 0; i--) {
+      const vg = this.villages[i];
+      if (vg.migCd > 0) continue;
+      if (vg.hungerY >= MIG_THRESHOLD && vg.agents.length >= VILLAGE_MIN_POP) {
+        for (const a of vg.agents) if (a.body >= 0) this.releaseBody(a);
+        this.bands.push({ u: vg.u, v: vg.v, wander: 0, agents: vg.agents, food: vg.foodStock, migCd: MIG_COOLDOWN, ox: vg.u, oy: vg.v });
+        this.villages.splice(i, 1); this.migrations++;
+      } else if (vg.agents.length >= FISSION_POP && vg.surplusY >= FISSION_SURPLUS) {
+        const take = Math.floor(vg.agents.length * 0.3);
+        if (take >= 2) {
+          const movers = vg.agents.splice(vg.agents.length - take, take);
+          for (const a of movers) { a.line = this.nextLine++; if (a.body >= 0) this.releaseBody(a); }
+          this.bands.push({ u: vg.u, v: vg.v, wander: 0, agents: movers, food: vg.foodStock * 0.3, migCd: MIG_COOLDOWN, ox: vg.u, oy: vg.v });
+          vg.foodStock *= 0.7; vg.surplusY = 0; this.recomputeDemo(vg);
+        }
+      }
+    }
+  }
+
+  // 全滅回避: 総人口 < RESPAWN_POP が続いたら最適水辺に4人band(4新line)を約45実秒毎
+  private respawnIfEmpty() {
+    if (this._live() < RESPAWN_POP) {
+      this.respawnAcc += DT_Y;
+      if (this.respawnAcc >= RESPAWN_SEC / YEAR_SEC) {
+        this.respawnAcc = 0;
+        // 最適地(水辺=suitability高)を粗探索
+        let bu = 0.5, bv = 0.5, best = -1;
+        for (let j = 0; j < 16; j++) for (let k = 0; k < 16; k++) {
+          const u = (k + 0.5) / 16, v = (j + 0.5) / 16, s = this.suitability(u, v);
+          if (s > best) { best = s; bu = u; bv = v; }
+        }
+        const agents: LifeAgent[] = [];
+        for (let m = 0; m < 4; m++) agents.push(this.newFounder(18 + this.rngSim() * 4, (m % 2 === 0 ? 0 : 1)));
+        this.bands.push({ u: bu, v: bv, wander: 0, agents, food: BAND_FOOD_INIT, migCd: 0 });
+      }
+    } else this.respawnAcc = 0;
   }
 
   // 加齢 + 死(自然=age≥span / 運死=誕生日にhazardロール)。生存者を返す。
@@ -435,7 +514,10 @@ export class VillageSystem {
     const takeFish = this.eco.harvestFish(vg.u, vg.v, fishers, DT_Y);
     const takeAnimal = this.eco.harvestLand(vg.u, vg.v, hunters, DT_Y);
     const harvestRate = (takeFish + takeAnimal) / DT_Y; // fu/年
-    const intakeRate = GATHER_BASE * effW * s + harvestRate; // fu/年
+    // 気候振動 ±30%・周期12年・地域位相(放置でも凶作/豊作が巡る=創発の核)
+    const ph = (this.clock() / CLIMATE_PERIOD + vg.phi);
+    const climate = 1 + CLIMATE_AMP * CLIMATE_LUT[(((Math.floor(ph * 256) % 256) + 256) % 256)];
+    const intakeRate = (GATHER_BASE * effW * s + harvestRate) * climate; // fu/年
     if (this.testInfFood) {
       vg.foodStock = storageCap; vg.hungerY = 0; vg.deathAcc = 0; vg.surplusY += DT_Y;
       return { intakeRate: Math.max(intakeRate, upkeep * 1.2), upkeep, builders };
@@ -530,6 +612,7 @@ export class VillageSystem {
       agents.push({ id: this.nextId++, age: 0, sex, span, preg: 0, line, body: -1 });
       this.totalBirths++;
     }
+    if (vg.birthAcc >= 1 && agents.length >= MAX_AGENTS) { this.atCapacity = true; vg.birthAcc = 0; } // 収容力到達=出生を静かに棄却
   }
 
   // 植生スコア(M3植生未実装のfallback): 平地×低地×湿り。木の上限に使う。川を掘ると森が濃い。
@@ -540,12 +623,14 @@ export class VillageSystem {
     const wet = this.sensor.wetUV(u, v);
     return flat * (1 - en) * (0.3 + 0.7 * Math.min(1, wet * 2));
   }
-  private makeVillage(u: number, v: number, agents: LifeAgent[]): Village {
+  private makeVillage(u: number, v: number, agents: LifeAgent[], migCd = 0, food?: number): Village {
     const huts = autoHuts(agents.length); // 新村の家credit(鶏卵回避)
+    const phi = hash01(Math.round(u * 32) + Math.round(v * 32) * 37 + 1); // 地域ごとの気候位相
     const vg: Village = {
       u, v, huts, age: 0, agents, birthAcc: 0, kids: 0, adultsF: 0, adultsM: 0, elders: 0,
-      foodStock: huts * STORE_PER_HUT, hungerY: 0, surplusY: 0, deathAcc: 0,
+      foodStock: food ?? huts * STORE_PER_HUT, hungerY: 0, surplusY: 0, deathAcc: 0,
       trees: TREES_CAP_BASE * this.vegScore(u, v), site: null,
+      migCd, phi,
     };
     this.recomputeDemo(vg);
     return vg;
@@ -755,6 +840,7 @@ export class VillageSystem {
       food: Math.round(food * 100) / 100,
       huts, trees: Math.round(trees),
       fish: Math.round(this.eco.totals().fish), animals: Math.round(this.eco.totals().land),
+      migrations: this.migrations, atCapacity: this.atCapacity,
     };
   }
 
@@ -785,6 +871,11 @@ export class VillageSystem {
   _suit(u: number, v: number): number { return this.suitability(u, v); }
   _villageDemo(i: number) { const v = this.villages[i]; if (!v) return null; return { pop: v.agents.length, kids: v.kids, af: v.adultsF, am: v.adultsM, elders: v.elders, food: Math.round(v.foodStock * 100) / 100, hunger: Math.round(v.hungerY * 100) / 100, huts: v.huts }; }
   _villageBuild(i: number) { const v = this.villages[i]; if (!v) return null; return { huts: v.huts, trees: Math.round(v.trees * 100) / 100, site: v.site ? { logs: Math.round(v.site.logs * 100) / 100, workY: Math.round(v.site.workY * 1000) / 1000, stage: v.site.stage } : null }; }
+  _villageMig(i: number) { const v = this.villages[i]; if (!v) return null; return { pop: v.agents.length, hungerY: Math.round(v.hungerY * 1000) / 1000, migCd: Math.round(v.migCd * 100) / 100, surplusY: Math.round(v.surplusY * 100) / 100 }; }
+  _forceHunger(i: number, y: number) { const v = this.villages[i]; if (v) { v.hungerY = y; v.migCd = 0; } }
+  _forceSurplus(i: number, y: number) { const v = this.villages[i]; if (v) { v.surplusY = y; v.migCd = 0; } }
+  _migrations() { return this.migrations; }
+  _counters7() { return { migrations: this.migrations, villages: this.villages.length, bands: this.bands.length, live: this._live(), atCapacity: this.atCapacity }; }
   _woodStats() {
     let siteLogs = 0; for (const v of this.villages) if (v.site) siteLogs += v.site.logs;
     return { chopped: Math.round(this.totalChopped * 1000) / 1000, treesConsumed: Math.round(this.totalTreesConsumed * 1000) / 1000, hutsCompleted: this.hutsCompleted, siteLogs: Math.round(siteLogs * 1000) / 1000 };
