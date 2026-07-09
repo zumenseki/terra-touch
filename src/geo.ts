@@ -401,7 +401,7 @@ async function main() {
 
   // ── 神の川ツール: 恒常水源(spring)。なぞった経路に水源を落とす。 ──
   const MAX_SPRINGS = IS_TOUCH ? 4 : 8;
-  const SPRING_Q = 0.4; // 水深レート m/s (雨0.1の局所強化版・セルサイズ非依存)
+  const SPRING_Q = 1.5; // 水深レート m/s (雨0.1の局所強化版・セルサイズ非依存)。実機FBで0.4→1.5に増量
   let riverMode = false;
   let lastSpringU = -1, lastSpringV = -1;
   const springCount = () => (USE_GPU ? gpuSim!.springs.length : cpuSim!.springs.length);
@@ -411,6 +411,35 @@ async function main() {
     everRained = true; settle = Math.max(settle, 120);
   };
   const simClearSprings = () => { if (USE_GPU) gpuSim!.springs.length = 0; else cpuSim!.clearSprings(); };
+
+  // 水源マーカー: 水が出ている所に青く光る水柱(実機FB「水が出てるか見えない」対策)
+  const springGeo = new THREE.CylinderGeometry(worldW * 0.0012, worldW * 0.004, worldW * 0.02, 8);
+  springGeo.translate(0, worldW * 0.01, 0);
+  const springMat = new THREE.MeshBasicNodeMaterial({ color: 0x3fd0ff, transparent: true, opacity: 0.8 });
+  const springMarks = new THREE.InstancedMesh(springGeo, springMat, MAX_SPRINGS);
+  springMarks.frustumCulled = false; springMarks.count = MAX_SPRINGS; springMarks.renderOrder = 2;
+  const _springDummy = new THREE.Object3D();
+  const _springZero = new THREE.Matrix4().makeScale(0, 0, 0);
+  for (let i = 0; i < MAX_SPRINGS; i++) springMarks.setMatrixAt(i, _springZero);
+  scene.add(springMarks);
+  const updateSpringMarks = (t: number) => {
+    const gpuList = USE_GPU ? gpuSim!.springs : null;
+    const cpuList = USE_GPU ? null : cpuSim!.springs;
+    const len = USE_GPU ? gpuList!.length : cpuList!.length;
+    for (let i = 0; i < MAX_SPRINGS; i++) {
+      if (i < len) {
+        let u: number, v: number;
+        if (USE_GPU) { u = gpuList![i].u; v = gpuList![i].v; }
+        else { u = cpuList![i].i / (SIM_N - 1); v = cpuList![i].j / (SIM_N - 1); }
+        const x = u * worldW - worldW / 2, z = worldW / 2 - v * worldW;
+        const pulse = 1 + 0.3 * Math.sin(t * 5 + i * 1.3);
+        _springDummy.position.set(x, sampleH(x, z), z);
+        _springDummy.scale.set(1, pulse, 1); _springDummy.rotation.set(0, 0, 0); _springDummy.updateMatrix();
+        springMarks.setMatrixAt(i, _springDummy.matrix);
+      } else springMarks.setMatrixAt(i, _springZero);
+    }
+    springMarks.instanceMatrix.needsUpdate = true;
+  };
 
   function applyBrush(dt: number) {
     if (!sculpting || !pointer.has) return;
@@ -613,18 +642,7 @@ async function main() {
       camera.position.copy(controls.target).add(off);
       if (Math.hypot(camGoal.x - controls.target.x, camGoal.y - controls.target.y, camGoal.z - controls.target.z) < worldW * 0.001) camGoal = null;
     }
-    if (tiltSuspend > 0) { tiltSuspend -= dt; }
-    else {
-      const off = camera.position.clone().sub(controls.target);
-      const r = off.length();
-      const f = Math.min(1, Math.max(0, (r - CAM_MIN_D) / (CAM_MAX_D * 0.5)));
-      const goalPolar = THREE.MathUtils.degToRad(45 + 25 * f);
-      const curPolar = Math.acos(Math.min(1, Math.max(-1, off.y / r)));
-      const np = curPolar + (goalPolar - curPolar) * (1 - Math.exp(-1.5 * dt));
-      const azim = Math.atan2(off.x, off.z), sinP = Math.sin(np);
-      off.set(r * sinP * Math.sin(azim), r * Math.cos(np), r * sinP * Math.cos(azim));
-      camera.position.copy(controls.target).add(off);
-    }
+    // ズーム連動チルトは撤去(idle時に傾きを勝手に戻す=「勝手に視点が動く」原因だった)。傾きは手動のみ。
     controls.update();
     const g = sampleH(camera.position.x, camera.position.z) + worldW * 0.006;
     if (camera.position.y < g) camera.position.y += (g - camera.position.y) * 0.3;
@@ -661,6 +679,7 @@ async function main() {
     }
 
     stepCamera(dt);
+    updateSpringMarks(uTime.value);
     renderer.render(scene, camera);
     frames++;
     if (now - statLast >= 500) {

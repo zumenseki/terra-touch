@@ -348,7 +348,7 @@ export class TerrainSim {
 
     // 神の川ツール: 恒常水源(複数)。水深レート方式(円錐0..1・セルサイズ非依存・GPU kSourceと同型)。
     if (this.springs.length > 0) {
-      const rad = Math.max(1, Math.round((cell * N) / 256 / cell)); // ~world/256 in cells
+      const rad = Math.max(2, Math.round((cell * N) / 160 / cell)); // ~world/160 in cells(実機FBで拡大)
       for (const sp of this.springs) {
         const rate = sp.q; // m/s 水深(中心)
         for (let dj = -rad; dj <= rad; dj++) for (let di = -rad; di <= rad; di++) {

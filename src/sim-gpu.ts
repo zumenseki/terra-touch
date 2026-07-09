@@ -91,7 +91,7 @@ export class GpuSim {
     this.uTalus.value = Math.tan(TALUS_ANGLE) * this.cell;
     this.brushRadius = opts.world / 40;
     this.digRate = this.brushRadius * 0.4;
-    this.springRad = Math.max(2 * this.cell, opts.world / 256);
+    this.springRad = Math.max(2.5 * this.cell, opts.world / 160);
 
     // 初期 state バッファ (bedrock を x に)
     const len = N * N;
