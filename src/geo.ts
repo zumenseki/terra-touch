@@ -517,6 +517,8 @@ async function main() {
     async totals() { return USE_GPU ? await gpuSim!.totals() : cpuSim!.totals(); },
     // 決定論再シード(A/B比較・回帰用)。以降の村乱数列が固定される。
     seedRng(n: number) { ensureVillage(); village!.reseed(n); },
+    // cap非依存検証用: 独立した村システム(sceneに追加しない)を生成
+    _mkSim(maxPeople: number) { return new VillageSystem(worldSensor, { maxPeople }); },
     // カメラ検証用
     camera: {
       focusOn(u: number, v: number) { focusWorld(u * worldW - worldW / 2, worldW / 2 - v * worldW); },
@@ -613,7 +615,7 @@ async function main() {
       }
       if (gameMode && village) {
         const s = village.stats();
-        civEl.textContent = `🏘${s.villages} 👥${s.pop}${s.bands ? ` (移動中${s.bands})` : ''}`;
+        civEl.textContent = `⏳${Math.floor(s.year)}y 🏘${s.villages} 👥${s.pop}${s.bands ? ` (移動中${s.bands})` : ''} 👶${s.kids} 🧑${s.adults} 👴${s.elders}`;
       }
       frames = 0; statLast = now;
     }
