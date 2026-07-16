@@ -891,8 +891,9 @@ export class VillageSystem {
       for (let p = 0; p < SMOKE_PER_FIRE; p++) {
         const ph = (this.t * 0.35 + p / SMOKE_PER_FIRE + fi * 0.37) % 1;
         const fade = ph < 0.8 ? 1 : Math.max(0, (1 - ph) / 0.2);
-        const sc = U * (0.5 + ph * 1.1) * fade;
-        d.position.y = baseY + ph * U * 3.2;
+        // 🔴 scale は無単位倍率(ジオメトリが既に U*0.28 の実寸)。U を掛けると画面を埋める球になる。
+        const sc = (0.35 + ph * 0.75) * fade;
+        d.position.y = baseY + ph * U * 2.2;
         d.rotation.set(0, 0, 0);
         d.scale.setScalar(sc); d.updateMatrix();
         this.smokeMesh.setMatrixAt(si++, d.matrix);

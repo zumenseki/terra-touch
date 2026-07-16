@@ -4,6 +4,7 @@
 // 詳細裏設定: docs/SPEC-life-sim.md §7。
 
 import * as THREE from 'three/webgpu';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import type { WorldSensor } from './village';
 
 const ECO_N = 32;
@@ -13,6 +14,7 @@ const D_FISH = 1.0, D_LAND = 0.6;      // 拡散 /年
 const K_FISH_MAX = 24, K_LAND_MAX = 16;
 const CMAX_FISH = 6, CMAX_LAND = 3, NHALF_FISH = 6, NHALF_LAND = 4, MAX_TAKE = 0.4;
 const FISH_WATER_MIN = 0.15;
+const LAND_SHOW_MIN = 2.2; // 獣を描く密度しきい。鹿は適正サイズなので数がいてよい(要望=動物を増やす)
 
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
 const smooth = (a: number, b: number, x: number) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
@@ -40,12 +42,23 @@ export class EcologySystem {
     this.sensor = sensor;
     this.fishCap = opts?.fishCap ?? 120;
     this.animalCap = opts?.animalCap ?? 60;
-    // 魚 = 扁平ダイヤ(菱形)。獣 = 低い箱胴+脚(鹿/猪の抽象)。
-    const fishGeo = new THREE.OctahedronGeometry(1, 0); fishGeo.scale(1.6, 0.5, 0.8);
+    // 魚 = 扁平ダイヤ(菱形)+尾びれ。
+    // 🔴 mergeGeometries は index の有無が揃っていないと null を返す。
+    //    Octahedron=非インデックス / Cone=インデックス付き → 尾を toNonIndexed() で揃える。
+    const fishBody = new THREE.OctahedronGeometry(1, 0); fishBody.scale(1.5, 0.45, 0.75);
+    const fishTailI = new THREE.ConeGeometry(0.5, 0.7, 4); fishTailI.rotateZ(Math.PI / 2); fishTailI.scale(1, 1, 0.35); fishTailI.translate(-1.7, 0, 0);
+    const fishGeo = mergeGeometries([fishBody, fishTailI.toNonIndexed()]);
+    if (!fishGeo) throw new Error('fish geometry merge failed');
     const fishMat = new THREE.MeshStandardNodeMaterial({ color: 0x8899aa, roughness: 0.5, metalness: 0.1 });
     this.fishMesh = new THREE.InstancedMesh(fishGeo, fishMat, this.fishCap);
     this.fishMesh.frustumCulled = false; this.fishMesh.count = this.fishCap;
-    const animalGeo = new THREE.BoxGeometry(1.6, 0.9, 0.7); animalGeo.translate(0, 0.6, 0);
+    // 獣 = 鹿の抽象(胴+4脚+首+頭)。単位長~1.2・高さ~1.15 で作り、描画時にスケール。
+    const aBody = new THREE.BoxGeometry(1.0, 0.42, 0.38); aBody.translate(0, 0.58, 0);
+    const aLeg = (x: number, z: number) => { const l = new THREE.BoxGeometry(0.09, 0.5, 0.09); l.translate(x, 0.25, z); return l; };
+    const aNeck = new THREE.BoxGeometry(0.15, 0.36, 0.15); aNeck.translate(0.44, 0.84, 0);
+    const aHead = new THREE.BoxGeometry(0.3, 0.17, 0.16); aHead.translate(0.57, 1.0, 0);
+    const animalGeo = mergeGeometries([aBody, aLeg(-0.34, 0.13), aLeg(-0.34, -0.13), aLeg(0.34, 0.13), aLeg(0.34, -0.13), aNeck, aHead]);
+    if (!animalGeo) throw new Error('animal geometry merge failed');
     const animalMat = new THREE.MeshStandardNodeMaterial({ color: 0x7a5a3a, roughness: 0.9 });
     this.animalMesh = new THREE.InstancedMesh(animalGeo, animalMat, this.animalCap);
     this.animalMesh.frustumCulled = false; this.animalMesh.count = this.animalCap;
@@ -173,7 +186,10 @@ export class EcologySystem {
     const posAt = (u: number, v: number, yOff: number) => {
       d.position.set(u * W - W / 2, this.sensor.heightUV(u, v) * this.sensor.vertExag + yOff, W / 2 - v * W);
     };
-    const sz = W * 0.0016;
+    // 実寸基準: 人の背丈 H = W*0.004*1.35 ≈ 172。魚は人の1/5、鹿は人の0.55倍の背丈。
+    const H = W * 0.004 * 1.35;
+    const fishSz = H * 0.10;   // 菱形半径 → 魚の全長 ~ H*0.3
+    const deerSz = H * 0.55;   // 単位獣(高さ~1.15)→ 鹿の背丈 ~ H*0.63
     // 魚: 水深十分なセルに密度比で配置
     let fi = 0;
     for (let cj = 0; cj < ECO_N && fi < this.fishCap; cj++) for (let ci = 0; ci < ECO_N && fi < this.fishCap; ci++) {
@@ -186,8 +202,8 @@ export class EcologySystem {
       for (let m = 0; m < cnt && fi < this.fishCap; m++) {
         const hsh = ((c * 2654435761 + m * 40503) >>> 0) / 4294967296;
         const ju = (hsh - 0.5) * 0.9 / ECO_N, jv = (((c * 7 + m * 13) % 97) / 97 - 0.5) * 0.9 / ECO_N;
-        posAt(u + ju, v + jv, this.sensor.vertExag * water * 0.5 + sz);
-        d.rotation.set(0, hsh * 6.28, 0); d.scale.setScalar(sz); d.updateMatrix();
+        posAt(u + ju, v + jv, this.sensor.vertExag * water * 0.4 + fishSz * 0.5);
+        d.rotation.set(0, hsh * 6.28, 0); d.scale.setScalar(fishSz); d.updateMatrix();
         this.fishMesh.setMatrixAt(fi++, d.matrix);
       }
     }
@@ -197,14 +213,14 @@ export class EcologySystem {
     let ai = 0;
     for (let cj = 0; cj < ECO_N && ai < this.animalCap; cj++) for (let ci = 0; ci < ECO_N && ai < this.animalCap; ci++) {
       const c = cj * ECO_N + ci; const dens = this.land[c];
-      if (dens < 2) continue;
+      if (dens < LAND_SHOW_MIN) continue; // 生息地に集める(全面に湧かせない)
       const u = (ci + 0.5) / ECO_N, v = (cj + 0.5) / ECO_N;
-      const cnt = Math.min(2, Math.floor(dens / 5) + 1);
+      const cnt = Math.min(2, Math.floor(dens / 6) + 1);
       for (let m = 0; m < cnt && ai < this.animalCap; m++) {
         const hsh = ((c * 2246822519 + m * 3266489917) >>> 0) / 4294967296;
         const ju = (hsh - 0.5) * 0.9 / ECO_N, jv = (((c * 11 + m * 17) % 89) / 89 - 0.5) * 0.9 / ECO_N;
         posAt(u + ju, v + jv, 0);
-        d.rotation.set(0, hsh * 6.28, 0); d.scale.setScalar(sz * 1.6); d.updateMatrix();
+        d.rotation.set(0, hsh * 6.28, 0); d.scale.setScalar(deerSz); d.updateMatrix();
         this.animalMesh.setMatrixAt(ai++, d.matrix);
       }
     }
