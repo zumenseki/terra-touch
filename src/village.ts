@@ -128,6 +128,8 @@ interface Person {
 const MAX_HUTS = 1500;
 const MAX_FIRES = 200;
 const SMOKE_PER_FIRE = 3;
+const MAX_TREES = 800;          // N8.1 全村合計の木インスタンス上限
+const TREE_SHOW_CAP = 30;       // 1村あたり表示本数の上限(vg.trees は最大24*vegScore)
 
 function paint(geo: THREE.BufferGeometry, hex: number): THREE.BufferGeometry {
   const c = new THREE.Color(hex);
@@ -146,6 +148,8 @@ export class VillageSystem {
   private hutMeshes: THREE.InstancedMesh[] = []; // 3段: テント/藁小屋/丸太家
   private fireMesh: THREE.InstancedMesh;
   private smokeMesh: THREE.InstancedMesh;
+  private treeMesh!: THREE.InstancedMesh;        // N8.1 木(村ごと vg.trees を実体表示)
+  private treeSig = '';
   private dummy = new THREE.Object3D();
   private U: number;
   private t = 0;
@@ -243,6 +247,13 @@ export class VillageSystem {
     const smMat = new THREE.MeshBasicNodeMaterial({ color: 0x9a9488, transparent: true, opacity: 0.28, depthWrite: false });
     this.smokeMesh = new THREE.InstancedMesh(smGeo, smMat, MAX_FIRES * SMOKE_PER_FIRE);
     this.smokeMesh.count = 0; this.smokeMesh.frustumCulled = false; this.smokeMesh.renderOrder = 1; this.group.add(this.smokeMesh);
+
+    // N8.1 木: 幹(円柱・茶) + 葉(円錐・緑) を merge。実寸=人(H≈U*1.35)より高い ~U*1.9。
+    const trunk = new THREE.CylinderGeometry(U * 0.08, U * 0.11, U * 0.7, 6); trunk.translate(0, U * 0.35, 0);
+    const foliage = new THREE.ConeGeometry(U * 0.55, U * 1.25, 7); foliage.translate(0, U * 0.7 + U * 0.6, 0);
+    const treeGeo = mergeGeometries([paint(trunk, 0x6b4a2e), paint(foliage, 0x3f6b38)])!;
+    this.treeMesh = new THREE.InstancedMesh(treeGeo, hutMat, MAX_TREES);
+    this.treeMesh.count = 0; this.treeMesh.frustumCulled = false; this.group.add(this.treeMesh);
 
     this.buildPeople();
 
@@ -353,6 +364,7 @@ export class VillageSystem {
     this.villages = []; this.bands = []; this.dyingList = [];
     this.eco.clear(); this.ecoRefreshAcc = 0;
     for (const m of this.hutMeshes) m.count = 0; this.fireMesh.count = 0; this.smokeMesh.count = 0; this.hutSig = '';
+    this.treeMesh.count = 0; this.treeSig = '';
     for (const p of this.pool) { p.active = false; p.dying = false; p.fade = 1; p.homeRef = null; p.homeKind = null; p.agent = null; }
     for (const m of this.allParts) { for (let i = 0; i < this.maxPeople; i++) m.setMatrixAt(i, this.mZero); m.instanceMatrix.needsUpdate = true; }
     this.totalFounders = 0; this.totalBirths = 0; this.totalDeaths = 0;
@@ -922,6 +934,30 @@ export class VillageSystem {
     }
     this.fireMesh.count = fi; this.fireMesh.instanceMatrix.needsUpdate = true;
     this.smokeMesh.count = si; this.smokeMesh.instanceMatrix.needsUpdate = true;
+
+    // N8.1 木: 表示本数 = min(TREE_SHOW_CAP, round(vg.trees))。伐採で減り再生で戻る。
+    // 村の周り(家の外側リング)に決定論ハッシュで配置。VIEWのみ=vg.trees は SIM 値で不変。
+    let tsig = this.villages.length + '|';
+    for (const vg of this.villages) tsig += Math.round(vg.trees) + ',' + Math.round(vg.u * 1e4) + ',' + Math.round(vg.v * 1e4) + ';';
+    if (tsig !== this.treeSig) {
+      this.treeSig = tsig;
+      let ti = 0;
+      for (const vg of this.villages) {
+        const show = Math.min(TREE_SHOW_CAP, Math.round(vg.trees));
+        const base = (Math.round(vg.u * 1e4) * 73856093) ^ (Math.round(vg.v * 1e4) * 19349663);
+        for (let k = 0; k < show && ti < MAX_TREES; k++) {
+          const h1 = (((base + k * 2654435761) >>> 0) / 4294967296);
+          const h2 = ((((base ^ 0x9e3779b9) + k * 40503) >>> 0) / 4294967296);
+          const ang = h1 * Math.PI * 2, rad = U * (3.0 + h2 * 4.0); // 家(最大~U*1.3*√12)の外側
+          const u = vg.u + (Math.cos(ang) * rad) / W, v = vg.v + (Math.sin(ang) * rad) / W;
+          this.pos(u, v, d.position); d.rotation.set(0, h1 * 6.28, 0);
+          d.scale.setScalar(0.8 + 0.5 * h2); d.updateMatrix();
+          this.treeMesh.setMatrixAt(ti++, d.matrix);
+        }
+      }
+      for (let k = ti; k < this.treeMesh.count; k++) this.treeMesh.setMatrixAt(k, this.mZero);
+      this.treeMesh.count = ti; this.treeMesh.instanceMatrix.needsUpdate = true;
+    }
   }
 
   stats() {
