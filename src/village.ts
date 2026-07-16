@@ -121,6 +121,7 @@ interface Person {
 
 const MAX_HUTS = 1500;
 const MAX_FIRES = 200;
+const SMOKE_PER_FIRE = 3;
 
 function paint(geo: THREE.BufferGeometry, hex: number): THREE.BufferGeometry {
   const c = new THREE.Color(hex);
@@ -136,8 +137,9 @@ export class VillageSystem {
   villages: Village[] = [];
   private bands: Band[] = [];
   private sensor: WorldSensor;
-  private hutMesh: THREE.InstancedMesh;
+  private hutMeshes: THREE.InstancedMesh[] = []; // 3段: テント/藁小屋/丸太家
   private fireMesh: THREE.InstancedMesh;
+  private smokeMesh: THREE.InstancedMesh;
   private dummy = new THREE.Object3D();
   private U: number;
   private t = 0;
@@ -202,15 +204,33 @@ export class VillageSystem {
     this.rngSim = mulberry32(seed);
     this.rngView = mulberry32((seed ^ 0x9e3779b9) >>> 0);
 
-    const wall = new THREE.CylinderGeometry(U * 0.55, U * 0.7, U * 0.7, 7); wall.translate(0, U * 0.35, 0);
-    const roof = new THREE.ConeGeometry(U * 0.95, U * 0.85, 7); roof.translate(0, U * 0.7 + U * 0.42, 0);
-    const hutGeo = mergeGeometries([paint(wall, 0xb39e7d), paint(roof, 0x6f4a2e)])!;
-    this.hutMesh = new THREE.InstancedMesh(hutGeo, new THREE.MeshStandardNodeMaterial({ vertexColors: true, roughness: 0.9 }), MAX_HUTS);
-    this.hutMesh.count = 0; this.hutMesh.frustumCulled = false; this.group.add(this.hutMesh);
+    // 家3段成長: テント(cone) → 藁小屋(壁+茅葺) → 丸太家(箱+切妻)。村の人口で段階。
+    const mkTent = () => { const c = new THREE.ConeGeometry(U * 0.55, U * 0.95, 6); c.translate(0, U * 0.47, 0); return paint(c, 0xa89478); };
+    const mkStraw = () => {
+      const wall = new THREE.CylinderGeometry(U * 0.55, U * 0.7, U * 0.7, 7); wall.translate(0, U * 0.35, 0);
+      const roof = new THREE.ConeGeometry(U * 0.95, U * 0.85, 7); roof.translate(0, U * 0.7 + U * 0.42, 0);
+      return mergeGeometries([paint(wall, 0xc9b07a), paint(roof, 0x8a6a3a)])!;
+    };
+    const mkLog = () => {
+      const body = new THREE.BoxGeometry(U * 1.15, U * 0.8, U * 0.95); body.translate(0, U * 0.4, 0);
+      const roof = new THREE.ConeGeometry(U * 0.98, U * 0.55, 4); roof.rotateY(Math.PI / 4); roof.translate(0, U * 0.8 + U * 0.27, 0);
+      return mergeGeometries([paint(body, 0x8a6a45), paint(roof, 0x5a4530)])!;
+    };
+    const hutMat = new THREE.MeshStandardNodeMaterial({ vertexColors: true, roughness: 0.9 });
+    for (const g of [mkTent(), mkStraw(), mkLog()]) {
+      const m = new THREE.InstancedMesh(g, hutMat, MAX_HUTS);
+      m.count = 0; m.frustumCulled = false; this.group.add(m); this.hutMeshes.push(m);
+    }
 
     const fGeo = new THREE.ConeGeometry(U * 0.3, U * 0.7, 6); fGeo.translate(0, U * 0.35, 0);
     this.fireMesh = new THREE.InstancedMesh(fGeo, new THREE.MeshBasicNodeMaterial({ color: 0xff7a26 }), MAX_FIRES);
     this.fireMesh.count = 0; this.fireMesh.frustumCulled = false; this.group.add(this.fireMesh);
+
+    // 焚き火の煙(立ち昇る半透明パフ)。村に生活感。
+    const smGeo = new THREE.SphereGeometry(U * 0.28, 6, 5);
+    const smMat = new THREE.MeshBasicNodeMaterial({ color: 0x9a9488, transparent: true, opacity: 0.28, depthWrite: false });
+    this.smokeMesh = new THREE.InstancedMesh(smGeo, smMat, MAX_FIRES * SMOKE_PER_FIRE);
+    this.smokeMesh.count = 0; this.smokeMesh.frustumCulled = false; this.smokeMesh.renderOrder = 1; this.group.add(this.smokeMesh);
 
     this.buildPeople();
 
@@ -309,7 +329,7 @@ export class VillageSystem {
   clear() {
     this.villages = []; this.bands = []; this.dyingList = [];
     this.eco.clear(); this.ecoRefreshAcc = 0;
-    this.hutMesh.count = 0; this.fireMesh.count = 0; this.hutSig = '';
+    for (const m of this.hutMeshes) m.count = 0; this.fireMesh.count = 0; this.smokeMesh.count = 0; this.hutSig = '';
     for (const p of this.pool) { p.active = false; p.dying = false; p.fade = 1; p.homeRef = null; p.homeKind = null; p.agent = null; }
     for (const m of this.allParts) { for (let i = 0; i < this.maxPeople; i++) m.setMatrixAt(i, this.mZero); m.instanceMatrix.needsUpdate = true; }
     this.totalFounders = 0; this.totalBirths = 0; this.totalDeaths = 0;
@@ -792,40 +812,57 @@ export class VillageSystem {
 
   private renderStatic() {
     const W = this.sensor.worldW, U = this.U, d = this.dummy;
-    // 家: 村構成/建築ステージが変わった時だけ再構築(ダーティフラグ)。
+    // 家: 村構成/建築ステージ/成長段階が変わった時だけ再構築(ダーティフラグ)。
+    const stageOf = (pop: number) => (pop < 8 ? 0 : pop < 20 ? 1 : 2); // テント/藁/丸太
     let sig = this.villages.length + '|';
-    for (const vg of this.villages) sig += vg.huts + '/' + (vg.site ? vg.site.stage + 1 : 0) + ',' + Math.round(vg.u * 1e4) + ',' + Math.round(vg.v * 1e4) + ';';
+    for (const vg of this.villages) sig += vg.huts + '/' + (vg.site ? vg.site.stage + 1 : 0) + '/' + stageOf(vg.agents.length) + ',' + Math.round(vg.u * 1e4) + ',' + Math.round(vg.v * 1e4) + ';';
     if (sig !== this.hutSig) {
       this.hutSig = sig;
-      let hi = 0;
+      const hc = [0, 0, 0]; // 段階別カウンタ
       for (const vg of this.villages) {
-        for (let k = 0; k < vg.huts && hi < MAX_HUTS; k++) {
+        const st = stageOf(vg.agents.length);
+        const mesh = this.hutMeshes[st];
+        for (let k = 0; k < vg.huts && hc[st] < MAX_HUTS; k++) {
           const ang = k * 2.399963;
           const rad = U * 1.3 * Math.sqrt(k);
           const u = vg.u + (Math.cos(ang) * rad) / W, v = vg.v + (Math.sin(ang) * rad) / W;
           this.pos(u, v, d.position); d.rotation.set(0, ang * 2.1, 0);
           d.scale.setScalar(0.8 + 0.25 * ((k * 7) % 5) / 5); d.updateMatrix();
-          this.hutMesh.setMatrixAt(hi++, d.matrix);
+          mesh.setMatrixAt(hc[st]++, d.matrix);
         }
-        // 建築中サイト = 次のスパイラル位置に段階スケールの小屋(0.35→0.6→0.85)
-        if (vg.site && hi < MAX_HUTS) {
+        // 建築中サイト = 次のスパイラル位置に段階スケールの小屋(村の現段階メッシュで)
+        if (vg.site && hc[st] < MAX_HUTS) {
           const k = vg.huts, ang = k * 2.399963, rad = U * 1.3 * Math.sqrt(k);
           const u = vg.u + (Math.cos(ang) * rad) / W, v = vg.v + (Math.sin(ang) * rad) / W;
           this.pos(u, v, d.position); d.rotation.set(0, ang * 2.1, 0);
           d.scale.setScalar([0.35, 0.6, 0.85][vg.site.stage] ?? 0.35); d.updateMatrix();
-          this.hutMesh.setMatrixAt(hi++, d.matrix);
+          mesh.setMatrixAt(hc[st]++, d.matrix);
         }
       }
-      this.hutMesh.count = hi; this.hutMesh.instanceMatrix.needsUpdate = true;
+      for (let s = 0; s < 3; s++) { this.hutMeshes[s].count = hc[s]; this.hutMeshes[s].instanceMatrix.needsUpdate = true; }
     }
-    let fi = 0;
+    let fi = 0, si = 0;
     for (const vg of this.villages) {
       if (fi >= MAX_FIRES) break;
-      this.pos(vg.u, vg.v, d.position); d.rotation.set(0, 0, 0);
+      this.pos(vg.u, vg.v, d.position);
+      const baseY = d.position.y;
+      d.rotation.set(0, 0, 0);
       d.scale.set(1, 0.85 + 0.25 * Math.sin(this.t * 6 + fi), 1); d.updateMatrix();
-      this.fireMesh.setMatrixAt(fi++, d.matrix);
+      this.fireMesh.setMatrixAt(fi, d.matrix);
+      // 立ち昇る煙: 各パフが上昇→肥大→頂上でフェード(scale0)
+      for (let p = 0; p < SMOKE_PER_FIRE; p++) {
+        const ph = (this.t * 0.35 + p / SMOKE_PER_FIRE + fi * 0.37) % 1;
+        const fade = ph < 0.8 ? 1 : Math.max(0, (1 - ph) / 0.2);
+        const sc = U * (0.5 + ph * 1.1) * fade;
+        d.position.y = baseY + ph * U * 3.2;
+        d.rotation.set(0, 0, 0);
+        d.scale.setScalar(sc); d.updateMatrix();
+        this.smokeMesh.setMatrixAt(si++, d.matrix);
+      }
+      fi++;
     }
     this.fireMesh.count = fi; this.fireMesh.instanceMatrix.needsUpdate = true;
+    this.smokeMesh.count = si; this.smokeMesh.instanceMatrix.needsUpdate = true;
   }
 
   stats() {
