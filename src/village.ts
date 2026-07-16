@@ -120,6 +120,7 @@ interface Person {
   state: 'walk' | 'pause';
   timer: number; speed: number; phase: number; facing: number;
   fx: number; fy: number; // band 隊列オフセット
+  shelter: number;        // N8.2 表示: 1=屋外に見える / 0=家の中(非表示)。夜に0へ、朝に1へ。
   // 外見(体を借りた時に agent から決定・見た目の個体差/性差)
   sex: 0 | 1; skinIdx: number; hairLong: boolean;
   heightScale: number; shoulderW: number; hipW: number; gait: number;
@@ -130,6 +131,11 @@ const MAX_FIRES = 200;
 const SMOKE_PER_FIRE = 3;
 const MAX_TREES = 800;          // N8.1 全村合計の木インスタンス上限
 const TREE_SHOW_CAP = 30;       // 1村あたり表示本数の上限(vg.trees は最大24*vegScore)
+// N8.2 VIEW昼夜(SIMのclock/gameYearとは独立・実時間 this.t で駆動)
+const DAY_SEC = 8;              // 1日=8実秒
+const NIGHT_START = 0.72, NIGHT_END = 0.08; // 夜=[0.72,1)∪[0,0.08)
+const MEAL_CENTER = 0.45, MEAL_HALF = 0.05; // 食事窓=昼の中頃の短時間
+const NIGHTWATCH_FRAC = 0.15;  // この割合の体は夜も屋外に残す(画面が寂しくならない)
 
 function paint(geo: THREE.BufferGeometry, hex: number): THREE.BufferGeometry {
   const c = new THREE.Color(hex);
@@ -319,7 +325,7 @@ export class VillageSystem {
         idx: i, agent: null,
         active: false, dying: false, fade: 1,
         homeRef: null, homeKind: null,
-        u: 0, v: 0, tu: 0, tv: 0, state: 'walk', timer: 0, speed: 0.007, phase: i * 1.7, facing: 0, fx: 0, fy: 0,
+        u: 0, v: 0, tu: 0, tv: 0, state: 'walk', timer: 0, speed: 0.007, phase: i * 1.7, facing: 0, fx: 0, fy: 0, shelter: 1,
         sex: 1, skinIdx: 0, hairLong: false, heightScale: 1, shoulderW: 1, hipW: 1, gait: 1,
       });
     }
@@ -359,6 +365,11 @@ export class VillageSystem {
   }
 
   clock(): number { return this.ticksDone * DT_Y + this.simAcc / YEAR_SEC; }
+
+  // N8.2 VIEW昼夜(実時間 this.t 駆動・SIM非依存)。0=夜明け前〜1。
+  dayPhase(): number { const p = (this.t / DAY_SEC) % 1; return p < 0 ? p + 1 : p; }
+  private isNight(ph: number): boolean { return ph >= NIGHT_START || ph < NIGHT_END; }
+  private isMeal(ph: number): boolean { return Math.abs(ph - MEAL_CENTER) < MEAL_HALF; }
 
   clear() {
     this.villages = []; this.bands = []; this.dyingList = [];
@@ -721,7 +732,7 @@ export class VillageSystem {
   private assignBody(ref: Village | Band, kind: 'village' | 'band', a: LifeAgent): boolean {
     const p = this.pool.find((x) => !x.active);
     if (!p) return false;
-    p.active = true; p.dying = false; p.fade = 1; p.homeRef = ref; p.homeKind = kind; p.agent = a;
+    p.active = true; p.dying = false; p.fade = 1; p.shelter = 1; p.homeRef = ref; p.homeKind = kind; p.agent = a;
     a.body = p.idx;
     p.u = ref.u; p.v = ref.v; p.tu = ref.u; p.tv = ref.v; p.state = 'pause'; p.timer = this.rngView() * 1.5;
     p.speed = 0.005 + this.rngView() * 0.006;
@@ -790,6 +801,7 @@ export class VillageSystem {
   }
 
   // 論理更新のみ(移動/位相/向き)。描画は renderPeople が instance 行列へ。
+  // N8.2 昼夜(VIEW): 夜=家へ帰って隠れる / 食事窓=焚火に集まる / 昼=徘徊。SIM非依存。
   private updatePerson(p: Person, dt: number) {
     const W = this.sensor.worldW;
     let moved = 0;
@@ -797,15 +809,37 @@ export class VillageSystem {
       const band = p.homeRef as Band;
       p.tu = band.u + p.fx; p.tv = band.v + p.fy;
       moved = this.stepToward(p, p.speed * 1.6 * dt);
+      p.shelter = Math.min(1, p.shelter + dt * 2); // band は常に屋外
     } else if (p.homeRef) {
       const vg = p.homeRef as Village;
-      if (p.state === 'pause') {
-        p.timer -= dt;
-        if (p.timer <= 0) { this.wanderTarget(p, vg); p.state = 'walk'; }
-      } else {
+      const ph = this.dayPhase();
+      const watch = (((p.idx * 2654435761) >>> 0) / 4294967296) < NIGHTWATCH_FRAC; // 夜警は夜も屋外
+      if (this.isNight(ph) && !watch) {
+        // 家へ帰る: idx で散らした戸口へ向かい、着いたら中へ隠れる(shelter→0)
+        const hsh = ((p.idx * 40503) >>> 0) / 4294967296;
+        const a = hsh * Math.PI * 2, r = (this.U * (0.6 + hsh * 0.9)) / W;
+        p.tu = vg.u + Math.cos(a) * r; p.tv = vg.v + Math.sin(a) * r;
         moved = this.stepToward(p, p.speed * dt);
+        const near = Math.hypot(p.tu - p.u, p.tv - p.v) < p.speed * dt * 2;
+        p.shelter = Math.max(0, p.shelter + (near ? -dt * 2 : dt)); // 戸口で消える/移動中は見える
+      } else if (this.isMeal(ph)) {
+        // 食事: 焚火(村中心)へ集まって止まる
+        p.tu = vg.u; p.tv = vg.v;
         const du = p.tu - p.u, dv = p.tv - p.v;
-        if (Math.hypot(du, dv) < p.speed * dt * 1.2) { p.state = 'pause'; p.timer = 0.6 + this.rngView() * 3; }
+        if (Math.hypot(du, dv) > this.U * 0.4 / W) moved = this.stepToward(p, p.speed * dt);
+        else p.facing = Math.atan2(vg.u - p.u + 1e-6, -(vg.v - p.v));
+        p.shelter = Math.min(1, p.shelter + dt * 2);
+      } else {
+        // 昼: 従来の徘徊
+        if (p.state === 'pause') {
+          p.timer -= dt;
+          if (p.timer <= 0) { this.wanderTarget(p, vg); p.state = 'walk'; }
+        } else {
+          moved = this.stepToward(p, p.speed * dt);
+          const du = p.tu - p.u, dv = p.tv - p.v;
+          if (Math.hypot(du, dv) < p.speed * dt * 1.2) { p.state = 'pause'; p.timer = 0.6 + this.rngView() * 3; }
+        }
+        p.shelter = Math.min(1, p.shelter + dt * 2);
       }
     }
     p.phase += (moved * W) / this.stride;
@@ -817,7 +851,7 @@ export class VillageSystem {
       const i = p.idx;
       if (!(p.active && p.agent)) { this.zeroPersonParts(i); continue; }
       const ageScale = 0.4 + 0.6 * Math.min(p.agent.age, ADULT_AGE) / ADULT_AGE;
-      const s = p.fade * p.heightScale * ageScale;
+      const s = p.fade * p.heightScale * ageScale * p.shelter; // N8.2 shelter=0で家の中(非表示)
       if (s <= 0.001) { this.zeroPersonParts(i); continue; }
       this.pos(p.u, p.v, this.vPos);
       this.vPos.y += Math.abs(Math.cos(p.phase)) * this.U * 0.03 * s;

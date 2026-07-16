@@ -172,7 +172,9 @@ async function main() {
   const dir = new THREE.DirectionalLight(0xfff4e6, 3.0);
   dir.position.copy(sun).multiplyScalar(worldW);
   scene.add(dir);
-  scene.add(new THREE.HemisphereLight(0xbcd2ee, 0x4a4238, 0.55));
+  const hemi = new THREE.HemisphereLight(0xbcd2ee, 0x4a4238, 0.55);
+  scene.add(hemi);
+  const nightFog = new THREE.Color(); // N8.2 昼夜の霧/背景色を毎フレーム更新する作業用
 
   const demTexel = 1 / DEM_SIZE;
   const cell = worldW / DEM_SIZE;
@@ -603,7 +605,7 @@ async function main() {
 
   const simN = USE_GPU ? DEM_SIZE : SIM_N;
   (window as unknown as { __geo: unknown }).__geo = {
-    gpuSim, cpuSim, useGpu: USE_GPU,
+    gpuSim, cpuSim, useGpu: USE_GPU, renderer,
     seed: (u: number, v: number) => { ensureVillage(); gameMode = true; village!.seed(u, v); },
     village: () => village,
     // ヘッドレス検証用: 村ロジックを手動で進める (rAF停止中でも動く)
@@ -722,6 +724,16 @@ async function main() {
     if (gameMode && village) {
       village.update(Math.min(dt, 1 / 20));
       if (USE_GPU) { coarseTimer += dt; if (coarseTimer > 0.5) { coarseTimer = 0; gpuSim!.readCoarse().then(() => { coarseReady = true; }); } }
+      // N8.2 昼夜の減光(VIEWのみ)。地形は独自ノードマテリアルで three 光源に反応しないため、
+      // 全体に効く toneMappingExposure を dayPhase で動かす(+補助で光源/霧/背景も調整)。
+      const ph = village.dayPhase();
+      const daylight = 0.32 + 0.68 * Math.max(0, Math.sin((ph - 0.06) * Math.PI)); // 夜明け0.06→日没で山なり
+      renderer.toneMappingExposure = 0.32 + 0.68 * daylight; // 昼1.0付近→深夜0.35付近
+      dir.intensity = 3.0 * daylight;
+      hemi.intensity = 0.55 * (0.35 + 0.65 * daylight);
+      nightFog.setRGB(0.68 * (0.28 + 0.72 * daylight), 0.77 * (0.30 + 0.70 * daylight), 0.87 * (0.40 + 0.60 * daylight));
+      (scene.fog as THREE.Fog).color.copy(nightFog);
+      (scene.background as THREE.Color).copy(nightFog);
     }
 
     stepCamera(dt);
