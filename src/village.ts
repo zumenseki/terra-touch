@@ -106,6 +106,11 @@ interface Band {
   food: number; migCd: number;           // N7 携行食料 / 移住由来クールダウン
   ox?: number; oy?: number;              // 移住元(移住bandはここから離れて再定住)
 }
+// N8.3 マンモス個体。u,v,hp,tu,tv,wander は SIM(決定論・rngSim)。vu,vv,yaw,ph は VIEW(描画イーズ)。
+interface Mammoth {
+  id: number; u: number; v: number; tu: number; tv: number; hp: number; wander: number; respawn: number;
+  vu: number; vv: number; yaw: number; ph: number;
+}
 
 // N3: 体は部位別InstancedMesh(全人物で共有)。Person は論理状態+外見パラメータのみ。
 interface Person {
@@ -136,6 +141,11 @@ const DAY_SEC = 8;              // 1日=8実秒
 const NIGHT_START = 0.72, NIGHT_END = 0.08; // 夜=[0.72,1)∪[0,0.08)
 const MEAL_CENTER = 0.45, MEAL_HALF = 0.05; // 食事窓=昼の中頃の短時間
 const NIGHTWATCH_FRAC = 0.15;  // この割合の体は夜も屋外に残す(画面が寂しくならない)
+// N8.3 マンモス(SIM個体・固定数=cap非依存・rngSim駆動)。狩り(N8.4)の獲物。
+const MAX_MAMMOTH = 4;          // マップ上のマンモス数(maxPeople非依存)
+const MAMMOTH_HP0 = 100;        // 初期HP(N8.4狩りで削る)
+const MAMMOTH_SPEED = 0.006;    // 徘徊速度(uv/gameYear)
+const MAMMOTH_RESPAWN = 4;      // 狩られてから再出現まで(gameYear)
 
 function paint(geo: THREE.BufferGeometry, hex: number): THREE.BufferGeometry {
   const c = new THREE.Color(hex);
@@ -156,6 +166,9 @@ export class VillageSystem {
   private smokeMesh: THREE.InstancedMesh;
   private treeMesh!: THREE.InstancedMesh;        // N8.1 木(村ごと vg.trees を実体表示)
   private treeSig = '';
+  private mammoths: Mammoth[] = [];              // N8.3 マンモス個体(SIM)
+  private mammothMesh!: THREE.InstancedMesh;     // N8.3 マンモス描画
+  private nextMammothId = 1;
   private dummy = new THREE.Object3D();
   private U: number;
   private t = 0;
@@ -261,6 +274,25 @@ export class VillageSystem {
     this.treeMesh = new THREE.InstancedMesh(treeGeo, hutMat, MAX_TREES);
     this.treeMesh.count = 0; this.treeMesh.frustumCulled = false; this.group.add(this.treeMesh);
 
+    // N8.3 マンモス: 胴(大箱)+足4+鼻(先細)+牙2(白)。人(H≈U*1.35)の約2倍高。単位=U。
+    const mBody = new THREE.BoxGeometry(U * 2.0, U * 1.3, U * 1.0); mBody.translate(0, U * 1.5, 0);
+    const mHump = new THREE.SphereGeometry(U * 0.6, 8, 6); mHump.scale(1.3, 0.8, 1); mHump.translate(U * 0.5, U * 2.15, 0);
+    const mLeg = (x: number, z: number) => { const l = new THREE.CylinderGeometry(U * 0.24, U * 0.20, U * 0.9, 6); l.translate(x, U * 0.45, z); return l; };
+    const mHead = new THREE.BoxGeometry(U * 0.9, U * 0.9, U * 0.85); mHead.translate(-U * 1.15, U * 1.6, 0);
+    const mTrunk = new THREE.CylinderGeometry(U * 0.16, U * 0.28, U * 1.4, 6); mTrunk.rotateZ(Math.PI * 0.32); mTrunk.translate(-U * 1.55, U * 0.9, 0);
+    const mTusk = (z: number) => { const t = new THREE.ConeGeometry(U * 0.09, U * 1.0, 5); t.rotateZ(-Math.PI * 0.42); t.translate(-U * 1.7, U * 1.15, z); return paint(t, 0xe8e0d0); };
+    // 🔴 全パーツ index 付きで揃える(混在すると mergeGeometries が null→boundingSphere of null で描画クラッシュ・1a9fc39教訓)。
+    const mammothParts = [
+      paint(mBody, 0x6b5842), paint(mHump, 0x6b5842), paint(mHead, 0x6b5842), paint(mTrunk, 0x6b5842),
+      paint(mLeg(-0.7 * U, 0.35 * U), 0x6b5842), paint(mLeg(-0.7 * U, -0.35 * U), 0x6b5842),
+      paint(mLeg(0.7 * U, 0.35 * U), 0x6b5842), paint(mLeg(0.7 * U, -0.35 * U), 0x6b5842),
+      mTusk(0.28 * U), mTusk(-0.28 * U),
+    ];
+    const mammothGeo = mergeGeometries(mammothParts);
+    if (!mammothGeo) throw new Error('mammoth geometry merge failed');
+    this.mammothMesh = new THREE.InstancedMesh(mammothGeo, hutMat, MAX_MAMMOTH);
+    this.mammothMesh.count = 0; this.mammothMesh.frustumCulled = false; this.group.add(this.mammothMesh);
+
     this.buildPeople();
 
     this.eco = new EcologySystem(sensor, { fishCap: this.maxPeople * 2, animalCap: Math.max(5, Math.round(this.maxPeople / 5)) });
@@ -362,6 +394,7 @@ export class VillageSystem {
   reseed(seed: number) {
     this.rngSim = mulberry32(seed >>> 0);
     this.rngView = mulberry32((seed ^ 0x9e3779b9) >>> 0);
+    this.mammoths = []; // 次tickで新seedから再配置(決定論)
   }
 
   clock(): number { return this.ticksDone * DT_Y + this.simAcc / YEAR_SEC; }
@@ -371,11 +404,55 @@ export class VillageSystem {
   private isNight(ph: number): boolean { return ph >= NIGHT_START || ph < NIGHT_END; }
   private isMeal(ph: number): boolean { return Math.abs(ph - MEAL_CENTER) < MEAL_HALF; }
 
+  // ── N8.3 マンモス(SIM・rngSim・固定数=cap非依存) ──
+  private mammothSpawnPos(): { u: number; v: number } {
+    // 平地・非水域・低〜中標高を優先(rngSimで数点試し最良を採る)。決定論。
+    let bu = 0.5, bv = 0.5, best = -1;
+    for (let i = 0; i < 8; i++) {
+      const u = 0.08 + this.rngSim() * 0.84, v = 0.08 + this.rngSim() * 0.84;
+      const flat = this.flat(u, v);
+      const range = Math.max(1, this.sensor.elevMax - this.sensor.elevMin);
+      const en = Math.min(1, Math.max(0, (this.sensor.heightUV(u, v) - this.sensor.elevMin) / range));
+      const dry = this.sensor.waterUV(u, v) < 0.1 ? 1 : 0;
+      const score = flat * (1 - en * 0.6) * dry;
+      if (score > best) { best = score; bu = u; bv = v; }
+    }
+    return { u: bu, v: bv };
+  }
+  private newMammoth(): Mammoth {
+    const { u, v } = this.mammothSpawnPos();
+    return { id: this.nextMammothId++, u, v, tu: u, tv: v, hp: MAMMOTH_HP0, wander: 0, respawn: 0, vu: u, vv: v, yaw: 0, ph: 0 };
+  }
+  private initMammoths() {
+    this.mammoths = [];
+    for (let i = 0; i < MAX_MAMMOTH; i++) this.mammoths.push(this.newMammoth());
+  }
+  // SIM: 徘徊(rngSim) + 死んだ個体の respawn。位置は SIM 権威(狩り距離判定に使う)。
+  private mammothStep() {
+    for (const m of this.mammoths) {
+      if (m.hp <= 0) { // 狩られた個体は respawn 待ち→別地点へ復活
+        m.respawn -= DT_Y;
+        if (m.respawn <= 0) { const n = this.newMammoth(); m.u = n.u; m.v = n.v; m.tu = n.u; m.tv = n.v; m.hp = MAMMOTH_HP0; m.vu = n.u; m.vv = n.v; }
+        continue;
+      }
+      m.wander -= DT_Y;
+      if (m.wander <= 0 || Math.hypot(m.tu - m.u, m.tv - m.v) < 0.01) {
+        const a = this.rngSim() * Math.PI * 2, r = 0.05 + this.rngSim() * 0.15;
+        m.tu = Math.min(0.95, Math.max(0.05, m.u + Math.cos(a) * r));
+        m.tv = Math.min(0.95, Math.max(0.05, m.v + Math.sin(a) * r));
+        m.wander = 2 + this.rngSim() * 4;
+      }
+      const du = m.tu - m.u, dv = m.tv - m.v, dist = Math.hypot(du, dv);
+      if (dist > 1e-6) { const step = Math.min(MAMMOTH_SPEED * DT_Y, dist); m.u += (du / dist) * step; m.v += (dv / dist) * step; }
+    }
+  }
+
   clear() {
     this.villages = []; this.bands = []; this.dyingList = [];
     this.eco.clear(); this.ecoRefreshAcc = 0;
     for (const m of this.hutMeshes) m.count = 0; this.fireMesh.count = 0; this.smokeMesh.count = 0; this.hutSig = '';
     this.treeMesh.count = 0; this.treeSig = '';
+    this.mammoths = []; this.mammothMesh.count = 0;
     for (const p of this.pool) { p.active = false; p.dying = false; p.fade = 1; p.homeRef = null; p.homeKind = null; p.agent = null; }
     for (const m of this.allParts) { for (let i = 0; i < this.maxPeople; i++) m.setMatrixAt(i, this.mZero); m.instanceMatrix.needsUpdate = true; }
     this.totalFounders = 0; this.totalBirths = 0; this.totalDeaths = 0;
@@ -419,6 +496,7 @@ export class VillageSystem {
     for (const p of this.pool) if (p.active && !p.dying && p.agent) this.updatePerson(p, dt);
     this.renderPeople();
     this.eco.animate(dt); // 魚の泳ぎ/獣の歩き(view専用・simに影響しない)
+    this.renderMammoths(dt); // N8.3 マンモス描画(view位置がSIM位置へイーズ+歩きbob)
     this.renderStatic();
   }
 
@@ -463,6 +541,8 @@ export class VillageSystem {
     // 生態: 容量は低頻度更新(水/地形は緩変化)、密度は毎tick。
     if (++this.ecoRefreshAcc >= 20) { this.ecoRefreshAcc = 0; this.eco.refreshCapacity(); }
     this.eco.tick(DT_Y);
+    if (this.mammoths.length === 0) this.initMammoths(); // 初回tickで配置(rngSim=決定論・cap非依存)
+    this.mammothStep();                                  // N8.3 マンモス徘徊/respawn(rngSim)
     for (const vg of this.villages) {
       vg.agents = this.ageAndDie(vg.agents);
       if (this.testHuts >= 0) vg.huts = this.testHuts;
@@ -994,6 +1074,27 @@ export class VillageSystem {
     }
   }
 
+  // N8.3 マンモス描画(VIEW)。view位置(vu,vv)がSIM位置(u,v)へ毎フレームイーズ→0.5秒tickの
+  // ワープを消す。生存個体のみ描画・死亡個体はscale0。歩きbob+進行方向へyaw。
+  private renderMammoths(dt: number) {
+    const W = this.sensor.worldW, d = this.dummy, ex = this.sensor.vertExag;
+    const mZero = this.mZero;
+    let mi = 0;
+    for (const m of this.mammoths) {
+      if (m.hp <= 0) { this.mammothMesh.setMatrixAt(mi++, mZero); continue; }
+      const a = 1 - Math.exp(-4 * dt); // イーズ係数
+      const du = m.u - m.vu, dv = m.v - m.vv, dist = Math.hypot(du, dv);
+      m.vu += du * a; m.vv += dv * a;
+      if (dist > 1e-5) { m.yaw += this.angWrapV(Math.atan2(m.u - m.vu, -(m.v - m.vv)) - m.yaw) * Math.min(1, dt * 4); m.ph += dist * W / (this.U * 0.9); }
+      const bob = Math.abs(Math.sin(m.ph)) * this.U * 0.08 * Math.min(1, dist * 200);
+      this.pos(m.vu, m.vv, d.position); d.position.y += bob;
+      d.rotation.set(0, m.yaw, 0); d.scale.setScalar(1); d.updateMatrix();
+      this.mammothMesh.setMatrixAt(mi++, d.matrix);
+    }
+    this.mammothMesh.count = this.mammoths.length; this.mammothMesh.instanceMatrix.needsUpdate = true;
+  }
+  private angWrapV(a: number): number { return a - Math.round(a / (Math.PI * 2)) * Math.PI * 2; }
+
   stats() {
     let pop = 0, kids = 0, adults = 0, elders = 0, food = 0, huts = 0, trees = 0;
     for (const v of this.villages) { pop += v.agents.length; kids += v.kids; adults += v.adultsF + v.adultsM; elders += v.elders; food += v.foodStock; huts += v.huts; trees += v.trees; }
@@ -1053,4 +1154,7 @@ export class VillageSystem {
     };
   }
   _bestSuit(): number { let best = 0; const N = 40; for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) { const s = this.suitability((i + 0.5) / N, (j + 0.5) / N); if (s > best) best = s; } return best; }
+  // N8.3 マンモス(SIM状態・cap非依存/決定論検証用)
+  _mammoths() { return this.mammoths.map((m) => ({ id: m.id, u: Math.round(m.u * 1e5) / 1e5, v: Math.round(m.v * 1e5) / 1e5, hp: Math.round(m.hp * 100) / 100 })); }
+  _mammothHurt(i: number, dmg: number) { const m = this.mammoths[i]; if (m && m.hp > 0) { m.hp = Math.max(0, m.hp - dmg); if (m.hp <= 0) m.respawn = MAMMOTH_RESPAWN; } }
 }
