@@ -147,8 +147,12 @@ export class VillageSystem {
   private dyingList: { p: Person; t: number }[] = [];
 
   // N3: 部位別InstancedMesh(全人物共有・draw call ~10)
-  private partLegL!: THREE.InstancedMesh; private partLegR!: THREE.InstancedMesh;
-  private partArmL!: THREE.InstancedMesh; private partArmR!: THREE.InstancedMesh;
+  // 膝肘2セグ: 腿/脛(+足)・上腕/前腕
+  private partThighL!: THREE.InstancedMesh; private partThighR!: THREE.InstancedMesh;
+  private partShinL!: THREE.InstancedMesh; private partShinR!: THREE.InstancedMesh;
+  private partUpArmL!: THREE.InstancedMesh; private partUpArmR!: THREE.InstancedMesh;
+  private partForeL!: THREE.InstancedMesh; private partForeR!: THREE.InstancedMesh;
+  private thighLen = 0; private upArmLen = 0;
   private partTorso!: THREE.InstancedMesh; private partHead!: THREE.InstancedMesh;
   private partHairS!: THREE.InstancedMesh; private partHairL!: THREE.InstancedMesh;
   private partClothM!: THREE.InstancedMesh; private partClothF!: THREE.InstancedMesh;
@@ -160,6 +164,7 @@ export class VillageSystem {
   private H = 0; private hipY = 0; private torsoH = 0;
   // 再利用行列
   private mRoot = new THREE.Matrix4(); private mLocal = new THREE.Matrix4(); private mOut = new THREE.Matrix4();
+  private mLocal2 = new THREE.Matrix4();
   private qTmp = new THREE.Quaternion(); private eTmp = new THREE.Euler();
   private vTmp = new THREE.Vector3(); private vScl = new THREE.Vector3(); private vPos = new THREE.Vector3();
   private cTmp = new THREE.Color();
@@ -248,10 +253,18 @@ export class VillageSystem {
     this.H = H; this.hipY = hipY; this.torsoH = torsoH;
 
     // ── 部位ジオメトリ(各パーツは自身の pivot 原点で作る) ──
-    const legCap = new THREE.CapsuleGeometry(legR, legLen - 2 * legR, 4, 7); legCap.translate(0, -legLen / 2 + legR, 0);
-    const footGeo = new THREE.BoxGeometry(legR * 2, legR * 1.1, legR * 2.6); footGeo.translate(0, -legLen + legR * 0.5, legR * 0.6);
-    const legGeo = mergeGeometries([legCap, footGeo])!;                 // 脚+足(pivot=股関節)
-    const armGeo = new THREE.CapsuleGeometry(armR, armLen - 2 * armR, 4, 7); armGeo.translate(0, -armLen / 2 + armR, 0); // pivot=肩
+    // 膝肘2セグ: 腿(pivot=股)/脛+足(pivot=膝)・上腕(pivot=肩)/前腕(pivot=肘)
+    const thighLen = legLen * 0.52, shinLen = legLen * 0.48;
+    const upArmLen = armLen * 0.5, foreLen = armLen * 0.5;
+    this.thighLen = thighLen; this.upArmLen = upArmLen;
+    const thighGeo = new THREE.CapsuleGeometry(legR, thighLen - 2 * legR, 4, 7); thighGeo.translate(0, -thighLen / 2 + legR, 0);
+    const shinR = legR * 0.85;
+    const shinCap = new THREE.CapsuleGeometry(shinR, shinLen - 2 * shinR, 4, 7); shinCap.translate(0, -shinLen / 2 + shinR, 0);
+    const footGeo = new THREE.BoxGeometry(legR * 2, legR * 1.1, legR * 2.6); footGeo.translate(0, -shinLen + legR * 0.5, legR * 0.6);
+    const shinGeo = mergeGeometries([shinCap, footGeo])!;               // 脛+足(pivot=膝)
+    const upArmGeo = new THREE.CapsuleGeometry(armR, upArmLen - 2 * armR, 4, 7); upArmGeo.translate(0, -upArmLen / 2 + armR, 0);
+    const foreR = armR * 0.85;
+    const foreGeo = new THREE.CapsuleGeometry(foreR, foreLen - 2 * foreR, 4, 7); foreGeo.translate(0, -foreLen / 2 + foreR, 0);
     const torsoGeo = new THREE.CapsuleGeometry(H * 0.095, torsoH - H * 0.095, 5, 9);
     const headGeo = new THREE.SphereGeometry(H * 0.088, 12, 10);
     const hairSGeo = new THREE.SphereGeometry(H * 0.096, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.62); // 短髪(浅い帽)
@@ -273,12 +286,15 @@ export class VillageSystem {
       this.group.add(m); this.allParts.push(m);
       return m;
     };
-    this.partLegL = mk(legGeo, skinMat, true); this.partLegR = mk(legGeo, skinMat, true);
-    this.partArmL = mk(armGeo, skinMat, true); this.partArmR = mk(armGeo, skinMat, true);
+    this.partThighL = mk(thighGeo, skinMat, true); this.partThighR = mk(thighGeo, skinMat, true);
+    this.partShinL = mk(shinGeo, skinMat, true); this.partShinR = mk(shinGeo, skinMat, true);
+    this.partUpArmL = mk(upArmGeo, skinMat, true); this.partUpArmR = mk(upArmGeo, skinMat, true);
+    this.partForeL = mk(foreGeo, skinMat, true); this.partForeR = mk(foreGeo, skinMat, true);
     this.partTorso = mk(torsoGeo, skinMat, true); this.partHead = mk(headGeo, skinMat, true);
     this.partHairS = mk(hairSGeo, hairMat, false); this.partHairL = mk(hairLGeo, hairMat, false);
     this.partClothM = mk(clothMGeo, clothMat, false); this.partClothF = mk(clothFGeo, clothMat, false);
-    this.skinParts = [this.partLegL, this.partLegR, this.partArmL, this.partArmR, this.partTorso, this.partHead];
+    this.skinParts = [this.partThighL, this.partThighR, this.partShinL, this.partShinR,
+      this.partUpArmL, this.partUpArmR, this.partForeL, this.partForeR, this.partTorso, this.partHead];
 
     for (let i = 0; i < N; i++) {
       this.pool.push({
@@ -779,10 +795,22 @@ export class VillageSystem {
       this.mRoot.compose(this.vPos, this.qTmp, this.vScl.set(s, s, s));
       const sw = Math.sin(p.phase) * 0.6 * p.gait;
       const H = this.H, hipY = this.hipY, torsoH = this.torsoH;
-      this.setPart(this.partLegL, i, -H * 0.045 * p.hipW, hipY, 0, sw, 1, 1, 1);
-      this.setPart(this.partLegR, i, H * 0.045 * p.hipW, hipY, 0, -sw, 1, 1, 1);
-      this.setPart(this.partArmL, i, -H * 0.12 * p.shoulderW, hipY + torsoH * 0.92, 0, -sw * 0.7, 1, 1, 1);
-      this.setPart(this.partArmR, i, H * 0.12 * p.shoulderW, hipY + torsoH * 0.92, 0, sw * 0.7, 1, 1, 1);
+      // 脚: 腿(股で振る)+脛(膝で後ろへ曲がる。後ろに振れた側ほど曲げて踵を上げる)
+      const hipL = sw, hipR = -sw;
+      const kneeL = -Math.max(0, -hipL) * 1.4, kneeR = -Math.max(0, -hipR) * 1.4;
+      const legX = H * 0.045 * p.hipW;
+      this.setPart(this.partThighL, i, -legX, hipY, 0, hipL, 1, 1, 1);
+      this.setPart(this.partThighR, i, legX, hipY, 0, hipR, 1, 1, 1);
+      this.setPart2(this.partShinL, i, -legX, hipY, 0, hipL, this.thighLen, kneeL);
+      this.setPart2(this.partShinR, i, legX, hipY, 0, hipR, this.thighLen, kneeR);
+      // 腕: 上腕(肩で振る)+前腕(肘は常に軽く曲げ、前振り時に更に曲げる)
+      const shY = hipY + torsoH * 0.92, armX = H * 0.12 * p.shoulderW;
+      const armL = -sw * 0.7, armR2 = sw * 0.7;
+      const elbL = 0.25 + Math.max(0, armL) * 0.5, elbR = 0.25 + Math.max(0, armR2) * 0.5;
+      this.setPart(this.partUpArmL, i, -armX, shY, 0, armL, 1, 1, 1);
+      this.setPart(this.partUpArmR, i, armX, shY, 0, armR2, 1, 1, 1);
+      this.setPart2(this.partForeL, i, -armX, shY, 0, armL, this.upArmLen, elbL);
+      this.setPart2(this.partForeR, i, armX, shY, 0, armR2, this.upArmLen, elbR);
       this.setPart(this.partTorso, i, 0, hipY + torsoH * 0.5, 0, 0, p.shoulderW, 1, 1);
       this.setPart(this.partHead, i, 0, hipY + torsoH + H * 0.1, 0, 0, 1, 1, 1);
       if (p.hairLong) { this.setPart(this.partHairL, i, 0, hipY + torsoH + H * 0.11, 0, 0, 1, 1, 1); this.partHairS.setMatrixAt(i, this.mZero); }
@@ -791,6 +819,16 @@ export class VillageSystem {
       else { this.setPart(this.partClothF, i, 0, hipY + H * 0.02, 0, 0, p.hipW, 1, p.hipW); this.partClothM.setMatrixAt(i, this.mZero); }
     }
     for (const m of this.allParts) m.instanceMatrix.needsUpdate = true;
+  }
+  // 2セグ関節: local = T(off) * Rx(a1) * T(0,-len,0) * Rx(a2)。下位セグ(脛/前腕)の world 行列。
+  private setPart2(mesh: THREE.InstancedMesh, i: number, ox: number, oy: number, oz: number, a1: number, len: number, a2: number) {
+    this.qTmp.setFromEuler(this.eTmp.set(a1, 0, 0));
+    this.mLocal.compose(this.vTmp.set(ox, oy, oz), this.qTmp, this.vScl.set(1, 1, 1));
+    this.qTmp.setFromEuler(this.eTmp.set(a2, 0, 0));
+    this.mLocal2.compose(this.vTmp.set(0, -len, 0), this.qTmp, this.vScl.set(1, 1, 1));
+    this.mOut.multiplyMatrices(this.mLocal, this.mLocal2);
+    this.mOut.premultiply(this.mRoot);
+    mesh.setMatrixAt(i, this.mOut);
   }
   private setPart(mesh: THREE.InstancedMesh, i: number, ox: number, oy: number, oz: number, rotX: number, sx: number, sy: number, sz: number) {
     this.qTmp.setFromEuler(this.eTmp.set(rotX, 0, 0));
