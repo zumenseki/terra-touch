@@ -189,6 +189,33 @@ export class TerrainSim {
     this.springs.push({ i: Math.round(Math.min(Math.max(u, 0), 1) * (this.n - 1)), j: Math.round(Math.min(Math.max(v, 0), 1) * (this.n - 1)), q });
   }
   clearSprings() { this.springs.length = 0; }
+  /** 神の川ツール: uv 近傍の水源を消す(半径は uv)。消した数を返す。 */
+  removeSpringsNearUV(u: number, v: number, rad: number): number {
+    const before = this.springs.length;
+    this.springs = this.springs.filter((s) => Math.hypot(s.i / (this.n - 1) - u, s.j / (this.n - 1) - v) > rad);
+    return before - this.springs.length;
+  }
+
+  /** 神の川ツール(川消し): uv 中心・半径 radM(m) の水を割合 amount で消す。消した体積(m³)を返す。 */
+  eraseWaterUV(u: number, v: number, radM: number, amount = 1): number {
+    const N = this.n, W = this.water, cell = this.cell;
+    const a = Math.min(1, Math.max(0, amount));
+    const bi = Math.min(Math.max(u, 0), 1) * (N - 1), bj = Math.min(Math.max(v, 0), 1) * (N - 1);
+    const ext = Math.ceil(radM / cell) + 1;
+    let removed = 0;
+    for (let j = Math.max(0, Math.floor(bj - ext)); j <= Math.min(N - 1, Math.ceil(bj + ext)); j++) {
+      for (let i = Math.max(0, Math.floor(bi - ext)); i <= Math.min(N - 1, Math.ceil(bi + ext)); i++) {
+        const r = Math.hypot(i - bi, j - bj) * cell;
+        if (r >= radM) continue;
+        const rn = r / radM, wgt = Math.max(0, 1 - rn * rn);
+        const k = j * N + i, take = W[k] * a * wgt;
+        W[k] -= take; removed += take;
+      }
+    }
+    this.drained += removed * this.area; // 消した水は系外へ出た扱い(injected == water + drained を保つ)
+    this.terrainDirty = true;
+    return removed * this.area;
+  }
 
   surfaceHeightUV(u: number, v: number): number {
     const N = this.n;

@@ -1,7 +1,7 @@
 // terra-touch: 創世 — 生態システム (N6 魚+陸獣)。密度フィールド駆動(個体AIなし・決定論)。
 // 容量 K は水深/平地/緑度から。logistic 成長+seed+線形decay+拡散。村が Holling-II で収穫し
-// 魚/獣が多い水辺の適地度を上げて人を呼ぶ(誘引)。描画=密度から InstancedMesh を eco-tick 時に配置。
-// 詳細裏設定: docs/SPEC-life-sim.md §7。
+// 魚/獣が多い水辺の適地度を上げて人を呼ぶ(誘引)。描画=eco-tick が retarget でスロット目標を
+// 割当て、animate が毎フレーム泳ぎ/歩きで追従(InstancedMesh)。詳細裏設定: docs/SPEC-life-sim.md §7。
 
 import * as THREE from 'three/webgpu';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
@@ -18,6 +18,31 @@ const LAND_SHOW_MIN = 2.2; // 獣を描く密度しきい。鹿は適正サイ�
 
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
 const smooth = (a: number, b: number, x: number) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const slotHash = (i: number, salt: number) => (((i + 1) * salt) >>> 0) / 4294967296;
+const angWrap = (a: number) => a - Math.round(a / (Math.PI * 2)) * Math.PI * 2;
+
+// 泳ぎ/歩きの永続スロット(view専用)。eco-tick が目標(tu,tv)を書き、animate が毎フレーム追従させる。
+// 従来は eco-tick(0.5秒)毎に行列を置き直し=位置がワープしていた。
+class SlotAnim {
+  act: Uint8Array; fade: Float32Array;
+  u: Float32Array; v: Float32Array; tu: Float32Array; tv: Float32Array;
+  ph: Float32Array; yaw: Float32Array; rad: Float32Array;
+  constructor(n: number) {
+    this.act = new Uint8Array(n); this.fade = new Float32Array(n);
+    this.u = new Float32Array(n); this.v = new Float32Array(n);
+    this.tu = new Float32Array(n); this.tv = new Float32Array(n);
+    this.ph = new Float32Array(n); this.yaw = new Float32Array(n); this.rad = new Float32Array(n);
+  }
+  target(i: number, tu: number, tv: number) {
+    this.tu[i] = tu; this.tv[i] = tv;
+    if (!this.act[i]) {
+      this.act[i] = 1;
+      if (this.fade[i] <= 0.01) { this.u[i] = tu; this.v[i] = tv; } // 消え切っていたらその場に湧く(フェードイン)
+    }
+  }
+  deactivateFrom(n: number) { for (let i = n; i < this.act.length; i++) this.act[i] = 0; }
+  reset() { this.act.fill(0); this.fade.fill(0); this.rad.fill(0); }
+}
 
 export class EcologySystem {
   group = new THREE.Group();
@@ -37,6 +62,10 @@ export class EcologySystem {
   private fishCap: number;
   private animalCap: number;
   private dummy = new THREE.Object3D();
+  private fishAnim: SlotAnim;
+  private landAnim: SlotAnim;
+  private animT = 0;
+  private mZero = new THREE.Matrix4().makeScale(0, 0, 0);
 
   constructor(sensor: WorldSensor, opts?: { fishCap?: number; animalCap?: number }) {
     this.sensor = sensor;
@@ -62,15 +91,21 @@ export class EcologySystem {
     const animalMat = new THREE.MeshStandardNodeMaterial({ color: 0x7a5a3a, roughness: 0.9 });
     this.animalMesh = new THREE.InstancedMesh(animalGeo, animalMat, this.animalCap);
     this.animalMesh.frustumCulled = false; this.animalMesh.count = this.animalCap;
-    const z = new THREE.Matrix4().makeScale(0, 0, 0);
-    for (let i = 0; i < this.fishCap; i++) this.fishMesh.setMatrixAt(i, z);
-    for (let i = 0; i < this.animalCap; i++) this.animalMesh.setMatrixAt(i, z);
+    for (let i = 0; i < this.fishCap; i++) this.fishMesh.setMatrixAt(i, this.mZero);
+    for (let i = 0; i < this.animalCap; i++) this.animalMesh.setMatrixAt(i, this.mZero);
+    this.fishAnim = new SlotAnim(this.fishCap);
+    this.landAnim = new SlotAnim(this.animalCap);
     this.group.add(this.fishMesh); this.group.add(this.animalMesh);
   }
 
   clear() {
     this.fish.fill(0); this.land.fill(0); this.refreshed = false;
     this.harvestedFish = 0; this.harvestedLand = 0;
+    this.fishAnim.reset(); this.landAnim.reset();
+    for (let i = 0; i < this.fishCap; i++) this.fishMesh.setMatrixAt(i, this.mZero);
+    for (let i = 0; i < this.animalCap; i++) this.animalMesh.setMatrixAt(i, this.mZero);
+    this.fishMesh.instanceMatrix.needsUpdate = true;
+    this.animalMesh.instanceMatrix.needsUpdate = true;
   }
 
   private cellClamp(x: number) { return Math.min(ECO_N - 1, Math.max(0, Math.round(x * (ECO_N - 1)))); }
@@ -180,52 +215,128 @@ export class EcologySystem {
 
   totals() { let f = 0, l = 0; for (let i = 0; i < this.fish.length; i++) { f += this.fish[i]; l += this.land[i]; } return { fish: f, land: l }; }
 
-  // ── 描画(eco-tick 時に密度から instance 配置) ──
-  render() {
-    const W = this.sensor.worldW, d = this.dummy;
-    const posAt = (u: number, v: number, yOff: number) => {
-      d.position.set(u * W - W / 2, this.sensor.heightUV(u, v) * this.sensor.vertExag + yOff, W / 2 - v * W);
-    };
-    // 実寸基準: 人の背丈 H = W*0.004*1.35 ≈ 172。魚は人の1/5、鹿は人の0.55倍の背丈。
-    const H = W * 0.004 * 1.35;
-    const fishSz = H * 0.10;   // 菱形半径 → 魚の全長 ~ H*0.3
-    const deerSz = H * 0.55;   // 単位獣(高さ~1.15)→ 鹿の背丈 ~ H*0.63
-    // 魚: 水深十分なセルに密度比で配置
+  // セル内で実際に水がある地点を探す。🔴 eco セル(≈1km)に対し川幅は数百m ＝ セル中心や
+  // ランダムジッタで置くと陸に乗る(実機FB「水ないところを泳いでいる」の原因)。4×4 を走査し、
+  // 個体ごとに開始位置をずらす(同セルの魚が1点に固まらない)。見つからなければ null=出さない。
+  private findWater(cu: number, cv: number, start: number): { u: number; v: number } | null {
+    const S = 4, total = S * S;
+    for (let n = 0; n < total; n++) {
+      const m = (n + start) % total;
+      const su = ((m % S) + 0.5) / S - 0.5, sv = (Math.floor(m / S) + 0.5) / S - 0.5;
+      const u = cu + su * 0.95 / ECO_N, v = cv + sv * 0.95 / ECO_N;
+      if (this.sensor.waterUV(u, v) >= FISH_WATER_MIN) return { u, v };
+    }
+    return null;
+  }
+
+  // ── eco-tick: 密度からスロット目標を割当(移動/行列書込は animate が毎フレーム行う) ──
+  retarget() {
+    // 魚: 密度のあるセルの「水がある地点」に目標を置く
     let fi = 0;
     for (let cj = 0; cj < ECO_N && fi < this.fishCap; cj++) for (let ci = 0; ci < ECO_N && fi < this.fishCap; ci++) {
       const c = cj * ECO_N + ci; const dens = this.fish[c];
       if (dens < 3) continue;
       const u = (ci + 0.5) / ECO_N, v = (cj + 0.5) / ECO_N;
-      const water = this.sensor.waterUV(u, v);
-      if (water < FISH_WATER_MIN) continue;
       const cnt = Math.min(3, Math.floor(dens / 6) + 1);
       for (let m = 0; m < cnt && fi < this.fishCap; m++) {
         const hsh = ((c * 2654435761 + m * 40503) >>> 0) / 4294967296;
-        const ju = (hsh - 0.5) * 0.9 / ECO_N, jv = (((c * 7 + m * 13) % 97) / 97 - 0.5) * 0.9 / ECO_N;
-        posAt(u + ju, v + jv, this.sensor.vertExag * water * 0.4 + fishSz * 0.5);
-        d.rotation.set(0, hsh * 6.28, 0); d.scale.setScalar(fishSz); d.updateMatrix();
-        this.fishMesh.setMatrixAt(fi++, d.matrix);
+        const spot = this.findWater(u, v, Math.floor(hsh * 16) + m * 5);
+        if (!spot) break; // このセルは水無し=魚を出さない
+        this.fishAnim.target(fi++, spot.u, spot.v);
       }
     }
-    for (let k = fi; k < this.fishCap; k++) this.fishMesh.setMatrixAt(k, new THREE.Matrix4().makeScale(0, 0, 0));
-    this.fishMesh.count = this.fishCap; this.fishMesh.instanceMatrix.needsUpdate = true;
-    // 陸獣
+    this.fishAnim.deactivateFrom(fi);
+    // 陸獣: 生息地に集める(全面に湧かせない)
     let ai = 0;
     for (let cj = 0; cj < ECO_N && ai < this.animalCap; cj++) for (let ci = 0; ci < ECO_N && ai < this.animalCap; ci++) {
       const c = cj * ECO_N + ci; const dens = this.land[c];
-      if (dens < LAND_SHOW_MIN) continue; // 生息地に集める(全面に湧かせない)
+      if (dens < LAND_SHOW_MIN) continue;
       const u = (ci + 0.5) / ECO_N, v = (cj + 0.5) / ECO_N;
       const cnt = Math.min(2, Math.floor(dens / 6) + 1);
       for (let m = 0; m < cnt && ai < this.animalCap; m++) {
         const hsh = ((c * 2246822519 + m * 3266489917) >>> 0) / 4294967296;
         const ju = (hsh - 0.5) * 0.9 / ECO_N, jv = (((c * 11 + m * 17) % 89) / 89 - 0.5) * 0.9 / ECO_N;
-        posAt(u + ju, v + jv, 0);
-        d.rotation.set(0, hsh * 6.28, 0); d.scale.setScalar(deerSz); d.updateMatrix();
-        this.animalMesh.setMatrixAt(ai++, d.matrix);
+        this.landAnim.target(ai++, u + ju, v + jv);
       }
     }
-    for (let k = ai; k < this.animalCap; k++) this.animalMesh.setMatrixAt(k, new THREE.Matrix4().makeScale(0, 0, 0));
-    this.animalMesh.count = this.animalCap; this.animalMesh.instanceMatrix.needsUpdate = true;
+    this.landAnim.deactivateFrom(ai);
+  }
+
+  // ── 毎フレーム: 魚=アンカーへ滑らか接近+小周回遊泳、獣=ゆっくり歩き。出現/消滅はフェード ──
+  // view専用(ハッシュ駆動・rng不使用)なので sim の決定論/cap非依存に影響しない。
+  animate(dt: number) {
+    this.animT += dt;
+    const W = this.sensor.worldW, d = this.dummy, ex = this.sensor.vertExag;
+    // 実寸基準: 人の背丈 H = W*0.004*1.35 ≈ 172。魚は人の1/5、鹿は人の0.55倍の背丈。
+    const H = W * 0.004 * 1.35;
+    const fishSz = H * 0.10;   // 菱形半径 → 魚の全長 ~ H*0.3
+    const deerSz = H * 0.55;   // 単位獣(高さ~1.15)→ 鹿の背丈 ~ H*0.63
+    const fs = this.fishAnim;
+    for (let i = 0; i < this.fishCap; i++) {
+      if (!fs.act[i] && fs.fade[i] <= 0) continue;
+      const h1 = slotHash(i, 2654435761), h2 = slotHash(i, 2246822519), h3 = slotHash(i, 3266489917);
+      const omg = (0.6 + h1 * 0.9) * (h2 < 0.5 ? 1 : -1);  // 周回角速度 rad/s
+      const radMax = (0.04 + h2 * 0.10) / ECO_N;            // 周回半径の上限(川幅より小さめに取る)
+      fs.ph[i] += omg * dt;
+      let vu = 0, vv = 0;
+      const du = fs.tu[i] - fs.u[i], dv = fs.tv[i] - fs.v[i], dist = Math.hypot(du, dv);
+      if (dist > 1e-6) {
+        const spd = Math.min(dist * 1.5, 0.05);             // uv/s: 距離比例+上限(遠い再割当も泳いで移動)
+        vu = (du / dist) * spd; vv = (dv / dist) * spd;
+        const step = Math.min(spd * dt, dist);
+        fs.u[i] += (du / dist) * step; fs.v[i] += (dv / dist) * step;
+      }
+      fs.fade[i] = clamp(fs.fade[i] + (fs.act[i] ? dt : -dt) * 2.5, 0, 1);
+      const th = fs.ph[i];
+      // 周回は水がある間だけ広げる。はみ出す位置ならアンカー(retargetが水と確認済)へ退避。
+      let rad = Math.min(fs.rad[i] + radMax * dt, radMax);
+      let pu = fs.u[i] + Math.cos(th) * rad, pv = fs.v[i] + Math.sin(th) * rad;
+      let water = this.sensor.waterUV(pu, pv);
+      if (water < FISH_WATER_MIN) {
+        rad = 0; pu = fs.u[i]; pv = fs.v[i];
+        water = this.sensor.waterUV(pu, pv);
+        if (water < FISH_WATER_MIN) fs.act[i] = 0; // アンカーも干上がった=フェードアウト
+      }
+      fs.rad[i] = rad;
+      vu -= Math.sin(th) * rad * omg; vv += Math.cos(th) * rad * omg;
+      if (Math.hypot(vu, vv) > 1e-9) fs.yaw[i] += angWrap(Math.atan2(vv, vu) - fs.yaw[i]) * Math.min(1, dt * 5);
+      const sc = fishSz * (0.8 + 0.4 * h3) * fs.fade[i];
+      if (sc <= 1e-4) { this.fishMesh.setMatrixAt(i, this.mZero); continue; }
+      const bed = this.sensor.heightUV(pu, pv) * ex, half = sc * 0.45;
+      d.position.set(
+        pu * W - W / 2,
+        Math.max(bed + half, bed + ex * water * 0.45 + Math.sin(th * 2.3 + h3 * 6.28) * fishSz * 0.15),
+        W / 2 - pv * W);
+      d.rotation.set(Math.sin(th * 2 + h1 * 6.28) * 0.15, fs.yaw[i], 0);
+      d.scale.setScalar(sc); d.updateMatrix();
+      this.fishMesh.setMatrixAt(i, d.matrix);
+    }
+    this.fishMesh.instanceMatrix.needsUpdate = true;
+    // 獣: 目標へゆっくり歩き(歩幅bob+進行方向へ向く)。待機中は草を食む微小な首振りのみ。
+    const as = this.landAnim;
+    for (let i = 0; i < this.animalCap; i++) {
+      if (!as.act[i] && as.fade[i] <= 0) continue;
+      const h1 = slotHash(i, 2654435761), h2 = slotHash(i, 2246822519), h3 = slotHash(i, 3266489917);
+      let moving = 0;
+      const du = as.tu[i] - as.u[i], dv = as.tv[i] - as.v[i], dist = Math.hypot(du, dv);
+      if (dist > 1e-5) {
+        const spd = Math.min(dist * 1.2, 0.012);
+        const step = Math.min(spd * dt, dist);
+        as.u[i] += (du / dist) * step; as.v[i] += (dv / dist) * step;
+        as.ph[i] += (step * W) / (deerSz * 0.6);            // 歩幅~鹿の6割で bob 位相を進める
+        as.yaw[i] += angWrap(Math.atan2(dv, du) - as.yaw[i]) * Math.min(1, dt * 4);
+        moving = Math.min(1, dist * ECO_N * 3);
+      }
+      as.fade[i] = clamp(as.fade[i] + (as.act[i] ? dt : -dt) * 2.5, 0, 1);
+      const sc = deerSz * (0.85 + 0.3 * h3) * as.fade[i];
+      if (sc <= 1e-4) { this.animalMesh.setMatrixAt(i, this.mZero); continue; }
+      const bob = Math.abs(Math.sin(as.ph[i])) * deerSz * 0.05 * moving;
+      d.position.set(as.u[i] * W - W / 2, this.sensor.heightUV(as.u[i], as.v[i]) * ex + bob, W / 2 - as.v[i] * W);
+      d.rotation.set(0, as.yaw[i] + Math.sin(this.animT * (0.25 + h1 * 0.3) + h2 * 6.28) * 0.08, 0);
+      d.scale.setScalar(sc); d.updateMatrix();
+      this.animalMesh.setMatrixAt(i, d.matrix);
+    }
+    this.animalMesh.instanceMatrix.needsUpdate = true;
   }
 
   // 検証用

@@ -404,6 +404,7 @@ async function main() {
   const MAX_SPRINGS = IS_TOUCH ? 4 : 8;
   const SPRING_Q = 2.5; // 水深レート m/s。実機FBで0.4→1.5→2.5に増量(自然な溜まり/川に)
   let riverMode = false;
+  let riverDel = false;   // 川消しモード(なぞった所の水源を消す)
   let lastSpringU = -1, lastSpringV = -1;
   const springCount = () => (USE_GPU ? gpuSim!.springs.length : cpuSim!.springs.length);
   const simAddSpring = (u: number, v: number) => {
@@ -412,6 +413,30 @@ async function main() {
     everRained = true; settle = Math.max(settle, 120);
   };
   const simClearSprings = () => { if (USE_GPU) gpuSim!.springs.length = 0; else cpuSim!.clearSprings(); };
+  // 川消し = ①水源を消す(流入を止める) + ②なぞった所の水そのものを消す。
+  // 🔴 ①だけだと窪地の水が湖として残り「消えない」(実測: 水深 20.6m→14.4m で頭打ち)。
+  //    ②があれば指の下の水が即消え、雨で溜めた水も消せる。
+  const SPRING_DEL_RAD = 0.035;
+  const simRemoveSprings = (u: number, v: number) => {
+    let n = 0;
+    if (USE_GPU) {
+      const before = gpuSim!.springs.length;
+      gpuSim!.springs = gpuSim!.springs.filter((s) => Math.hypot(s.u - u, s.v - v) > SPRING_DEL_RAD);
+      n = before - gpuSim!.springs.length;
+    } else n = cpuSim!.removeSpringsNearUV(u, v, SPRING_DEL_RAD);
+    return n;
+  };
+  const simEraseWater = (u: number, v: number, amount = 1) => {
+    const radM = SPRING_DEL_RAD * worldW;
+    if (USE_GPU) gpuSim!.eraseWater(u, v, radM, amount);
+    else cpuSim!.eraseWaterUV(u, v, radM, amount);
+    settle = Math.max(settle, 600); // 残りを落ち着かせる
+  };
+  const simRiverDelete = (u: number, v: number, amount = 1) => {
+    const n = simRemoveSprings(u, v);
+    simEraseWater(u, v, amount);
+    return n;
+  };
 
   // 水源マーカー: 水面に寝た薄い波紋リング(前回の巨大円錐=不自然を廃止)
   const springGeo = new THREE.TorusGeometry(worldW * 0.003, worldW * 0.0006, 6, 20);
@@ -447,7 +472,10 @@ async function main() {
     const hit = pickWorld(pointer.x, pointer.y);
     if (!hit) return;
     const u = (hit.x + worldW / 2) / worldW, v = 0.5 - hit.z / worldW;
-    if (riverMode) {
+    if (riverDel) {
+      // なぞっている間ずっと効く。1フレーム分ずつ消すので指を留めるほど消える。
+      simRiverDelete(u, v, Math.min(1, 4 * Math.min(dt, 1 / 30)));
+    } else if (riverMode) {
       // なぞった経路に一定間隔で水源を落とす(既存 sim が下流へ流す=谷に川)
       const d = Math.hypot(u - lastSpringU, v - lastSpringV);
       if (lastSpringU < 0 || d > 0.03) { simAddSpring(u, v); lastSpringU = u; lastSpringV = v; }
@@ -465,16 +493,29 @@ async function main() {
   const btnRain = document.getElementById('rain')!;
   const btnReset = document.getElementById('reset')!;
   const btnRiver = document.getElementById('river');
-  const refreshRiverBtn = () => { if (btnRiver) btnRiver.classList.toggle('on', riverMode); };
-  const setMode = (m: 'dig' | 'raise') => { mode = m; riverMode = false; refreshRiverBtn(); btnDig.classList.toggle('on', m === 'dig'); btnRaise.classList.toggle('on', m === 'raise'); };
+  const btnRiverDel = document.getElementById('river-del');
+  const refreshRiverBtn = () => {
+    if (btnRiver) btnRiver.classList.toggle('on', riverMode);
+    if (btnRiverDel) btnRiverDel.classList.toggle('on', riverDel);
+  };
+  const setMode = (m: 'dig' | 'raise') => { mode = m; riverMode = false; riverDel = false; refreshRiverBtn(); btnDig.classList.toggle('on', m === 'dig'); btnRaise.classList.toggle('on', m === 'raise'); };
   const refreshLookBtn = () => { btnLook.textContent = sculptOn ? '✏️ 彫るモード' : '🖐 見るモード'; btnLook.classList.toggle('on', sculptOn); };
-  btnLook.addEventListener('click', () => { sculptOn = !sculptOn; riverMode = false; refreshRiverBtn(); applyControlMode(); refreshLookBtn(); });
+  btnLook.addEventListener('click', () => { sculptOn = !sculptOn; riverMode = false; riverDel = false; refreshRiverBtn(); applyControlMode(); refreshLookBtn(); });
   btnDig.addEventListener('click', () => { if (!sculptOn) { sculptOn = true; applyControlMode(); refreshLookBtn(); } setMode('dig'); });
   btnRaise.addEventListener('click', () => { if (!sculptOn) { sculptOn = true; applyControlMode(); refreshLookBtn(); } setMode('raise'); });
-  if (btnRiver) btnRiver.addEventListener('click', () => {
-    riverMode = !riverMode;
-    if (riverMode) { sculptOn = true; applyControlMode(); refreshLookBtn(); btnDig.classList.remove('on'); btnRaise.classList.remove('on'); }
+  // 川/川消しは排他。どちらも1本指でなぞる操作なので彫るモードを自動ON。
+  const enterRiverTool = () => {
+    sculptOn = true; applyControlMode(); refreshLookBtn();
+    btnDig.classList.remove('on'); btnRaise.classList.remove('on');
     lastSpringU = -1; refreshRiverBtn();
+  };
+  if (btnRiver) btnRiver.addEventListener('click', () => {
+    riverMode = !riverMode; riverDel = false;
+    if (riverMode) enterRiverTool(); else refreshRiverBtn();
+  });
+  if (btnRiverDel) btnRiverDel.addEventListener('click', () => {
+    riverDel = !riverDel; riverMode = false;
+    if (riverDel) enterRiverTool(); else refreshRiverBtn();
   });
   btnRain.addEventListener('click', () => {
     raining = !raining; simRain(raining ? 0.1 : 0);
@@ -488,7 +529,7 @@ async function main() {
       (cpuSim as unknown as { terrainDirty: boolean }).terrainDirty = true;
       cpuSim!.drained = 0; cpuSim!.injected = 0;
     }
-    simClearSprings(); riverMode = false; refreshRiverBtn(); lastSpringU = -1;
+    simClearSprings(); riverMode = false; riverDel = false; refreshRiverBtn(); lastSpringU = -1;
     raining = false; simRain(0); everRained = false; settle = 2;
     btnRain.textContent = '🌧 雨 OFF'; btnRain.classList.remove('on');
   });
@@ -595,6 +636,10 @@ async function main() {
       add: (u: number, v: number) => simAddSpring(u, v),
       clear: () => simClearSprings(),
       count: () => springCount(),
+      removeNear: (u: number, v: number, amount = 1) => simRiverDelete(u, v, amount),
+      removeSpringOnly: (u: number, v: number) => simRemoveSprings(u, v),
+      eraseWater: (u: number, v: number, amount = 1) => simEraseWater(u, v, amount),
+      delRad: SPRING_DEL_RAD,
       async flowFor(sec: number) {
         const f = Math.round(sec * 60);
         for (let k = 0; k < f; k++) { if (USE_GPU) gpuSim!.step(1, true); else { cpuSim!.step(1 / 60, 1); cpuSim!.sync(); } }

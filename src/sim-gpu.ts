@@ -67,6 +67,7 @@ export class GpuSim {
   private kSlump2: any;
   private kBrush: any;
   private kSource: any;
+  private kErase: any;
   private kCopy: any;
   // 神の川ツール: 恒常水源(spring)。step 毎に注入。q=m³/s。
   springs: { u: number; v: number; q: number }[] = [];
@@ -273,6 +274,21 @@ export class GpuSim {
       state.element(instanceIndex).assign(vec4(s.x, s.y, s.z.add(Q.mul(wgt)), s.w));
     })().compute(N * N);
 
+    // ── 水消し (神の川ツール: 川消し) ──
+    // 円錐で water を割合除去(中心=A・縁=0)。減算ではなく割合なので水深が負にならない。
+    this.kErase = Fn(() => {
+      const { i, j } = ijOf();
+      const bi = uSource.x.mul(Nf.sub(float(1)));
+      const bj = uSource.y.mul(Nf.sub(float(1)));
+      const R = uSource.z, A = uSource.w; // A = 中心で消す割合 0..1
+      const r = length(vec2(float(i).sub(bi), float(j).sub(bj))).mul(uCell);
+      const rn = r.div(R);
+      const t = float(1).sub(rn.mul(rn));
+      const wgt = select(r.lessThan(R), max(float(0), t), float(0));
+      const s = state.element(instanceIndex);
+      state.element(instanceIndex).assign(vec4(s.x, s.y, s.z.mul(float(1).sub(A.mul(wgt))), s.w));
+    })().compute(N * N);
+
     // ── 表示テクスチャへコピー ([bed+soil, water, wet, 1]) ──
     const dispTex = this.dispTex;
     this.kCopy = Fn(() => {
@@ -313,6 +329,13 @@ export class GpuSim {
     this.rainRate = 0;
     this.renderer.compute(this.kReset);
     this.renderer.compute(this.kCopy);
+  }
+
+  /** 神の川ツール(川消し): uv 中心・半径 radM(m) の水を割合 amount で消す */
+  eraseWater(u: number, v: number, radM: number, amount = 1) {
+    (this.uSource.value as THREE.Vector4).set(u, v, radM, Math.min(1, Math.max(0, amount)));
+    this.renderer.compute(this.kErase);
+    this.renderer.compute(this.kCopy); // 指を止めていても即座に見た目へ反映
   }
 
   /** 1 フレーム進める */
