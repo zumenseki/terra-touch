@@ -246,7 +246,7 @@ export class VillageSystem {
 
     this.buildPeople();
 
-    this.eco = new EcologySystem(sensor, { fishCap: this.maxPeople * 2, animalCap: this.maxPeople });
+    this.eco = new EcologySystem(sensor, { fishCap: this.maxPeople * 2, animalCap: Math.max(5, Math.round(this.maxPeople / 5)) });
     this.group.add(this.eco.group);
   }
 
@@ -814,8 +814,11 @@ export class VillageSystem {
       const sw = Math.sin(p.phase) * 0.6 * p.gait;
       const H = this.H, hipY = this.hipY, torsoH = this.torsoH;
       // 脚: 腿(股で振る)+脛(膝で後ろへ曲がる。後ろに振れた側ほど曲げて踵を上げる)
+      // 🔴 前方=+z / X回転+で足先は-z(後方)。膝は「後ろに振れた脚(hipL>0)」で正方向に曲げ、
+      //    踵を後ろ上へ上げる=膝が股-足首線の前に来る(人間)。旧 -max(0,-hipL) は前脚で曲げ
+      //    脛を前へ蹴り出し膝が線の後ろ=鳥脚(逆)になっていた(実機FB「関節が逆」)。
       const hipL = sw, hipR = -sw;
-      const kneeL = -Math.max(0, -hipL) * 1.4, kneeR = -Math.max(0, -hipR) * 1.4;
+      const kneeL = Math.max(0, hipL) * 1.4, kneeR = Math.max(0, hipR) * 1.4;
       const legX = H * 0.045 * p.hipW;
       this.setPart(this.partThighL, i, -legX, hipY, 0, hipL, 1, 1, 1);
       this.setPart(this.partThighR, i, legX, hipY, 0, hipR, 1, 1, 1);

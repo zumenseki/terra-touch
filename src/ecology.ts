@@ -14,7 +14,7 @@ const D_FISH = 1.0, D_LAND = 0.6;      // 拡散 /年
 const K_FISH_MAX = 24, K_LAND_MAX = 16;
 const CMAX_FISH = 6, CMAX_LAND = 3, NHALF_FISH = 6, NHALF_LAND = 4, MAX_TAKE = 0.4;
 const FISH_WATER_MIN = 0.15;
-const LAND_SHOW_MIN = 2.2; // 獣を描く密度しきい。鹿は適正サイズなので数がいてよい(要望=動物を増やす)
+const LAND_SHOW_MIN = 3.5; // 獣を描く密度しきい。実機FB「数が多すぎ」→2.2→3.5(最良habitatのみ)。数の律速は cap(=maxPeople/5)
 
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
 const smooth = (a: number, b: number, x: number) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
@@ -252,7 +252,7 @@ export class EcologySystem {
       const c = cj * ECO_N + ci; const dens = this.land[c];
       if (dens < LAND_SHOW_MIN) continue;
       const u = (ci + 0.5) / ECO_N, v = (cj + 0.5) / ECO_N;
-      const cnt = Math.min(2, Math.floor(dens / 6) + 1);
+      const cnt = 1; // 1セル1頭(実機FB「数が多すぎ」→群れず疎らに)
       for (let m = 0; m < cnt && ai < this.animalCap; m++) {
         const hsh = ((c * 2246822519 + m * 3266489917) >>> 0) / 4294967296;
         const ju = (hsh - 0.5) * 0.9 / ECO_N, jv = (((c * 11 + m * 17) % 89) / 89 - 0.5) * 0.9 / ECO_N;
