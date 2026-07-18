@@ -100,6 +100,7 @@ interface Village {
   foodStock: number; hungerY: number; surplusY: number; deathAcc: number;
   trees: number; site: BuildSite | null; // N4 建築
   migCd: number; phi: number;            // N7 移住クールダウン(gameYear) / 気候位相
+  hunt: { mid: number; deathAcc: number } | null; // N8.4 狩り中のマンモスid / 反撃死亡蓄積
 }
 interface Band {
   u: number; v: number; wander: number; tu?: number; tv?: number; agents: LifeAgent[];
@@ -146,6 +147,12 @@ const MAX_MAMMOTH = 4;          // マップ上のマンモス数(maxPeople非�
 const MAMMOTH_HP0 = 100;        // 初期HP(N8.4狩りで削る)
 const MAMMOTH_SPEED = 0.006;    // 徘徊速度(uv/gameYear)
 const MAMMOTH_RESPAWN = 4;      // 狩られてから再出現まで(gameYear)
+// N8.4 狩り(SIM解決・rngSim)。狩人=適齢男性。反撃で狩人死亡・撃破で食料windfall。
+const HUNT_RADIUS = 0.14;       // この距離内のマンモスを狩る(uv)
+const HUNT_MIN_HUNTERS = 2;     // 最低狩人数(これ未満は狩らない)
+const HUNT_DMG = 10;            // 狩人1人あたりの与ダメ / gameYear
+const MAMMOTH_ATTACK = 1.3;     // 反撃レート(死亡蓄積 /gameYear・親方=高リスク較正の起点)
+const MAMMOTH_FOOD = 44;        // 撃破の食料windfall(fu・貯蔵上限48を概ね満たす)
 
 function paint(geo: THREE.BufferGeometry, hex: number): THREE.BufferGeometry {
   const c = new THREE.Color(hex);
@@ -219,6 +226,8 @@ export class VillageSystem {
   private totalTreesConsumed = 0;
   private hutsCompleted = 0;     // 建築で完成した軒数
   private totalLogsUsed = 0;     // 完成した家が消費した丸太(段階別コスト・保存則の右辺)
+  private totalMammothKills = 0; // N8.4 撃破したマンモス累計
+  private totalCombatDeaths = 0; // N8.4 戦闘死(狩り反撃+村レイド)累計
   private migrations = 0;        // N7 移住回数
   private respawnAcc = 0;        // N7 リスポーン蓄積(gameYear)
   atCapacity = false;            // MAX_AGENTS 到達(HUD表示用)
@@ -444,6 +453,54 @@ export class VillageSystem {
       }
       const du = m.tu - m.u, dv = m.tv - m.v, dist = Math.hypot(du, dv);
       if (dist > 1e-6) { const step = Math.min(MAMMOTH_SPEED * DT_Y, dist); m.u += (du / dist) * step; m.v += (dv / dist) * step; }
+    }
+  }
+  private mammothById(id: number): Mammoth | null { for (const m of this.mammoths) if (m.id === id) return m; return null; }
+  private countHunters(vg: Village): number {
+    let n = 0; for (const a of vg.agents) if (a.sex === 1 && a.age >= ADULT_AGE && a.age < ELDER_AGE) n++; return n;
+  }
+  // N8.4 狩り(SIM・rngSim): 近くのマンモスに適齢男性を送る→hp削る/反撃で狩人死亡/撃破で食料windfall。
+  private huntStep(vg: Village) {
+    const hunters = this.countHunters(vg);
+    // 継続中の狩りを検証(獲物が生存&射程内か)
+    if (vg.hunt) {
+      const m = this.mammothById(vg.hunt.mid);
+      if (!m || m.hp <= 0 || Math.hypot(m.u - vg.u, m.v - vg.v) > HUNT_RADIUS * 1.4 || hunters < 1) { vg.hunt = null; }
+    }
+    // 新規着工: 射程内の最寄りマンモス & 狩人が足りる
+    if (!vg.hunt && hunters >= HUNT_MIN_HUNTERS) {
+      let best: Mammoth | null = null, bd = HUNT_RADIUS;
+      for (const m of this.mammoths) { if (m.hp <= 0) continue; const d = Math.hypot(m.u - vg.u, m.v - vg.v); if (d < bd) { bd = d; best = m; } }
+      if (best) vg.hunt = { mid: best.id, deathAcc: 0 };
+    }
+    if (!vg.hunt) return;
+    const m = this.mammothById(vg.hunt.mid);
+    if (!m) { vg.hunt = null; return; }
+    // 与ダメ(狩人数比例) + 反撃(死亡蓄積・狩人が多いほど的も増えるが総リスクは獲物の生存で決まる)
+    m.hp = Math.max(0, m.hp - HUNT_DMG * hunters * DT_Y);
+    vg.hunt.deathAcc += MAMMOTH_ATTACK * DT_Y;
+    let guard = 0;
+    while (vg.hunt.deathAcc >= 1 && this.countHunters(vg) > 0 && guard++ < MAX_AGENTS) {
+      vg.hunt.deathAcc -= 1; this.killHunter(vg);
+    }
+    if (m.hp <= 0) { // 撃破: 食料windfall + マンモスは respawn へ
+      const cap = Math.max(1, vg.huts) * STORE_PER_HUT;
+      vg.foodStock = Math.min(cap, vg.foodStock + MAMMOTH_FOOD);
+      this.totalMammothKills++;
+      m.respawn = MAMMOTH_RESPAWN; vg.hunt = null;
+    }
+  }
+  // 狩人(適齢男性)を1名戦死させる。居なければ他の成人。
+  private killHunter(vg: Village) {
+    let victim = -1;
+    for (let i = 0; i < vg.agents.length; i++) { const a = vg.agents[i]; if (a.sex === 1 && a.age >= ADULT_AGE && a.age < ELDER_AGE) { victim = i; break; } }
+    if (victim < 0) for (let i = 0; i < vg.agents.length; i++) if (vg.agents[i].age >= ADULT_AGE) { victim = i; break; }
+    if (victim >= 0) {
+      const a = vg.agents[victim];
+      this.totalDeaths++; this.totalCombatDeaths++;
+      if (this.recordDeaths) this.deathLog.push(a.age);
+      if (a.body >= 0) this.killBody(a);
+      vg.agents.splice(victim, 1);
     }
   }
 
@@ -787,7 +844,7 @@ export class VillageSystem {
       u, v, huts: 0, age: 0, agents, birthAcc: 0, kids: 0, adultsF: 0, adultsM: 0, elders: 0,
       foodStock: food ?? STORE_PER_HUT, hungerY: 0, surplusY: 0, deathAcc: 0,
       trees: TREES_CAP_BASE * this.vegScore(u, v), site: null,
-      migCd, phi,
+      migCd, phi, hunt: null,
     };
     this.recomputeDemo(vg);
     return vg;
